@@ -10,8 +10,8 @@ a windowless `mpv` child that resolves YouTube through `yt-dlp`; it uses about
 
 ## Status
 
-Prototype. Search, play, pause, stop. Live streams (lofi radios) work. No queue,
-library or volume control yet.
+Prototype. Search, play, a player view with the queue, pause, next/previous,
+volume. Live streams (lofi radios) work. No saved library or search history yet.
 
 ## Usage
 
@@ -23,15 +23,28 @@ One resident per user. `toggle` (Caps+M) shows or hides the popup, starting the
 resident if none is running; `quit` ends it and its player; `--hidden` starts it
 in the tray only.
 
-| Key | In the popup |
+Caps+M opens the **player** while something is playing, the **search** otherwise.
+The results you play from become the queue: at the end of a track the next one
+plays.
+
+| Key | Player |
+| --- | --- |
+| Space | Pause / resume |
+| → / ← | Next / previous (← restarts the track if you're past 3 s) |
+| ↑ / ↓ | Volume (max 100%) |
+| Any letter | Start a new search |
+| Tab | Search view |
+| Esc, click away | Hide |
+
+| Key | Search |
 | --- | --- |
 | Enter | Search (or play, if you pasted a YouTube link) |
 | ↓ / ↑ | Into the results / back to the search box |
-| Enter, double-click | Play the selected result |
+| Enter, double-click | Play the selected result and open the player |
 | Space | Pause / resume (in the results) |
-| Esc, click away | Hide |
+| Esc, Tab | Back to the player (Esc hides when nothing plays) |
 
-The tray icon: left-click toggles the popup; right-click has Pause, Stop and Quit.
+The tray icon: left-click toggles the popup; right-click has Pause, Next, Stop and Quit.
 The log is `%LOCALAPPDATA%\Musica\musica.log`.
 
 ## Build and install

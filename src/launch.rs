@@ -1,7 +1,9 @@
 //! `musica.exe [toggle | quit | --hidden]`: hand the request to the running
 //! resident, or become the resident. Same shape as tasca's launcher.
 
-use windows::core::{w, PCWSTR};
+use std::sync::OnceLock;
+
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, WPARAM};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -12,8 +14,32 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::log::log;
 
-pub const CLASS: PCWSTR = w!("Musica.Popup");
-pub const MUTEX: PCWSTR = w!("Local\\Musica.Resident");
+/// Window class and mutex of the resident. Debug builds only:
+/// `MUSICA_INSTANCE=<name>` gives them a suffix, so a test build can run next
+/// to the installed one without touching it. Release builds never read it.
+pub fn class() -> PCWSTR {
+    static NAME: OnceLock<Vec<u16>> = OnceLock::new();
+    PCWSTR(NAME.get_or_init(|| named("Musica.Popup")).as_ptr())
+}
+
+pub fn mutex() -> PCWSTR {
+    static NAME: OnceLock<Vec<u16>> = OnceLock::new();
+    PCWSTR(
+        NAME.get_or_init(|| named("Local\\Musica.Resident"))
+            .as_ptr(),
+    )
+}
+
+fn named(base: &str) -> Vec<u16> {
+    #[cfg(debug_assertions)]
+    if let Ok(suffix) = std::env::var("MUSICA_INSTANCE") {
+        return format!("{base}.{suffix}")
+            .encode_utf16()
+            .chain([0])
+            .collect();
+    }
+    base.encode_utf16().chain([0]).collect()
+}
 pub const WM_TOGGLE: u32 = WM_APP + 1;
 pub const WM_SHOW: u32 = WM_APP + 2;
 pub const WM_QUIT_RESIDENT: u32 = WM_APP + 3;
@@ -40,7 +66,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Command {
 }
 
 pub fn run(command: Command) -> i32 {
-    if let Ok(hwnd) = unsafe { FindWindowW(CLASS, PCWSTR::null()) } {
+    if let Ok(hwnd) = unsafe { FindWindowW(class(), PCWSTR::null()) } {
         let msg = match command {
             Command::Toggle => WM_TOGGLE,
             Command::Show => WM_SHOW,

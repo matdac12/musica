@@ -14,15 +14,21 @@ pub struct Track {
     /// Seconds; `None` for live streams.
     pub duration: Option<u64>,
     pub url: String,
+    /// False for a pasted link, whose length comes from mpv instead.
+    pub from_search: bool,
+}
+
+pub fn fmt_secs(s: u64) -> String {
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
 }
 
 impl Track {
     pub fn meta(&self) -> String {
-        let length = match self.duration {
-            Some(s) if s >= 3600 => format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60),
-            Some(s) => format!("{}:{:02}", s / 60, s % 60),
-            None => "live".into(),
-        };
+        let length = self.duration.map(fmt_secs).unwrap_or_else(|| "live".into());
         if self.channel.is_empty() {
             length
         } else {
@@ -68,6 +74,10 @@ pub fn parse(json: &[u8]) -> Result<Vec<Track>, String> {
     Ok(entries
         .iter()
         .filter_map(|e| {
+            // Videos only: channels and playlists come back as `YoutubeTab`.
+            if e["ie_key"].as_str().is_some_and(|k| k != "Youtube") {
+                return None;
+            }
             let id = e["id"].as_str()?;
             let url = e["url"]
                 .as_str()
@@ -82,6 +92,7 @@ pub fn parse(json: &[u8]) -> Result<Vec<Track>, String> {
                     .to_string(),
                 duration: e["duration"].as_f64().map(|d| d as u64),
                 url,
+                from_search: true,
             })
         })
         .collect())
@@ -95,7 +106,8 @@ mod tests {
     fn parses_flat_search() {
         let json = br#"{"entries":[
             {"id":"a1","title":"Lofi","channel":"Girl","duration":3882.0,"url":"https://www.youtube.com/watch?v=a1"},
-            {"id":"b2","title":"Radio","uploader":"Up","duration":null},
+            {"id":"UCx","ie_key":"YoutubeTab","title":"A channel","url":"https://www.youtube.com/channel/UCx"},
+            {"id":"b2","ie_key":"Youtube","title":"Radio","uploader":"Up","duration":null},
             {"title":"no id"}
         ]}"#;
         let t = parse(json).unwrap();

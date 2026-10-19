@@ -26,9 +26,18 @@ pub enum Event {
     Title(String),
     Paused(bool),
     Idle(bool),
+    Volume(f64),
+    /// Seconds; `None` while unknown (and for most live streams).
+    Duration(Option<f64>),
+    /// Answer to `query_pos`.
+    Pos(f64),
+    /// The track played to its end.
+    Eof,
     Error(String),
     Exited,
 }
+
+const POS_REQUEST: i64 = 10;
 
 pub type Notify = Box<dyn Fn(Event) + Send + Sync + 'static>;
 
@@ -63,6 +72,21 @@ impl Player {
 
     pub fn stop(&mut self) {
         self.send(json!({ "command": ["stop"] }));
+    }
+
+    pub fn restart_track(&mut self) {
+        self.send(json!({ "command": ["seek", 0, "absolute"] }));
+    }
+
+    pub fn add_volume(&mut self, delta: i32) {
+        self.send(json!({ "command": ["add", "volume", delta] }));
+    }
+
+    /// Ask for `time-pos`; the answer arrives as `Event::Pos`. Polled by the UI
+    /// while the player is on screen, rather than observed: an observed
+    /// time-pos would stream dozens of events a second all the time.
+    pub fn query_pos(&mut self) {
+        self.send(json!({ "command": ["get_property", "time-pos"], "request_id": POS_REQUEST }));
     }
 
     pub fn is_running(&mut self) -> bool {
@@ -100,6 +124,7 @@ impl Player {
             "--load-context-menu=no",
             "--load-console=no",
             "--osc=no",
+            "--volume-max=100",
             "--ytdl-format=bestaudio/best",
             // Keep the network buffer small: memory is the point of this app.
             "--demuxer-max-bytes=4MiB",
@@ -117,6 +142,11 @@ impl Player {
                 ytdlp.display()
             ));
         }
+        // Debug builds only: `MUSICA_TEST_AO=null` plays silently, for tests.
+        #[cfg(debug_assertions)]
+        if let Ok(ao) = std::env::var("MUSICA_TEST_AO") {
+            cmd.arg(format!("--ao={ao}"));
+        }
         let child = cmd
             .spawn()
             .map_err(|e| format!("mpv failed to start: {e}"))?;
@@ -132,7 +162,13 @@ impl Player {
 
         let conn = connect(&pipe, Duration::from_secs(5)).ok_or("mpv IPC pipe did not come up")?;
         let (tx, rx) = mpsc::channel::<String>();
-        for (id, prop) in [(1, "media-title"), (2, "pause"), (3, "idle-active")] {
+        for (id, prop) in [
+            (1, "media-title"),
+            (2, "pause"),
+            (3, "idle-active"),
+            (4, "volume"),
+            (5, "duration"),
+        ] {
             let _ = tx.send(json!({ "command": ["observe_property", id, prop] }).to_string());
         }
         let notify = self.notify.clone();
@@ -258,13 +294,19 @@ fn io_loop(mut conn: File, rx: Receiver<String>, notify: &(dyn Fn(Event) + Send 
 
 fn parse_event(line: &[u8]) -> Option<Event> {
     let v: Value = serde_json::from_slice(line).ok()?;
+    if v["request_id"] == POS_REQUEST {
+        return v["data"].as_f64().map(Event::Pos);
+    }
     match v["event"].as_str()? {
         "property-change" => match v["name"].as_str()? {
             "media-title" => Some(Event::Title(v["data"].as_str().unwrap_or("").to_string())),
             "pause" => Some(Event::Paused(v["data"].as_bool().unwrap_or(false))),
             "idle-active" => Some(Event::Idle(v["data"].as_bool().unwrap_or(false))),
+            "volume" => v["data"].as_f64().map(Event::Volume),
+            "duration" => Some(Event::Duration(v["data"].as_f64())),
             _ => None,
         },
+        "end-file" if v["reason"] == "eof" => Some(Event::Eof),
         "end-file" if v["reason"] == "error" => {
             let msg = v["file_error"]
                 .as_str()
@@ -296,6 +338,21 @@ mod tests {
             Some(Event::Error(_))
         ));
         assert!(ev(r#"{"event":"end-file","reason":"stop"}"#).is_none());
+        assert!(matches!(
+            ev(r#"{"event":"end-file","reason":"eof"}"#),
+            Some(Event::Eof)
+        ));
+        assert!(
+            matches!(ev(r#"{"data":12.5,"request_id":10,"error":"success"}"#), Some(Event::Pos(p)) if p == 12.5)
+        );
+        assert!(matches!(
+            ev(r#"{"event":"property-change","id":5,"name":"duration"}"#),
+            Some(Event::Duration(None))
+        ));
+        assert!(matches!(
+            ev(r#"{"event":"property-change","id":4,"name":"volume","data":85.0}"#),
+            Some(Event::Volume(v)) if v == 85.0
+        ));
         assert!(ev(r#"{"request_id":0,"error":"success"}"#).is_none());
     }
 }
