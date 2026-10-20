@@ -44,6 +44,15 @@ impl Track {
         }
     }
 
+    /// Same video: ids when both have one, else the URL. The library, the
+    /// results and the queue all point at one video with different `url`s.
+    pub fn is_same(&self, other: &Track) -> bool {
+        match (&self.id, &other.id) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.url == other.url,
+        }
+    }
+
     pub fn meta(&self) -> String {
         let length = self.duration.map(fmt_secs).unwrap_or_else(|| "live".into());
         if self.channel.is_empty() {
@@ -199,6 +208,17 @@ mod tests {
         ] {
             assert_eq!(youtube_id(u), None, "{u}");
         }
+    }
+
+    #[test]
+    fn same_video_by_id_else_url() {
+        let a = Track::from_link("https://youtu.be/dQw4w9WgXcQ".into());
+        let b = Track::from_link("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=5".into());
+        assert_ne!(a.url, b.url);
+        assert!(a.is_same(&b));
+        let c = Track::from_link("https://example.com/a".into());
+        assert!(c.is_same(&c.clone()));
+        assert!(!c.is_same(&a));
     }
 
     #[test]

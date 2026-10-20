@@ -138,6 +138,10 @@ struct App {
     paused: bool,
     pos: f64,
     mpv_duration: Option<f64>,
+    /// The playing track comes from the library file: mpv's title is the file
+    /// name then, so it is ignored, and the length is the index's.
+    local: bool,
+    local_duration: Option<f64>,
     /// App volume level 0..=100 (not mpv's volume); see `player::volume_for_level`.
     level: i32,
     /// What is on disk, so border presses don't rewrite the file.
@@ -174,7 +178,9 @@ impl App {
     /// means a live stream), else what mpv reports (pasted links).
     fn duration(&self) -> Option<f64> {
         let t = self.current()?;
-        if t.from_search {
+        if let Some(d) = self.local_duration.filter(|_| self.local) {
+            Some(d)
+        } else if t.from_search {
             t.duration.map(|d| d as f64)
         } else {
             self.mpv_duration
@@ -342,6 +348,8 @@ unsafe fn run_inner(show: bool) -> Result<i32> {
             paused: false,
             pos: 0.0,
             mpv_duration: None,
+            local: false,
+            local_duration: None,
             level: settings.level,
             saved_level: settings.level,
             volume_flash: None,
@@ -891,7 +899,22 @@ fn play_current() {
         a.pos = 0.0;
         a.mpv_duration = None;
         a.now_title = t.title.clone();
-        Some(a.player.play(&t.url))
+        // A saved track plays from its file (no network); if the file has
+        // gone, the URL.
+        let local = library::local_file(&a.lib_root, &a.lib, &t)
+            .map(|(e, path)| (e.title.clone(), e.duration, path));
+        a.local = local.is_some();
+        a.local_duration = None;
+        let target = match local {
+            Some((title, secs, path)) => {
+                log(format!("from disk: {}", path.display()));
+                a.now_title = title;
+                a.local_duration = (secs > 0).then_some(secs as f64);
+                path.to_string_lossy().into_owned()
+            }
+            None => t.url.clone(),
+        };
+        Some(a.player.play(&target))
     })
     .flatten();
     if let Some(Err(e)) = r {
@@ -946,6 +969,7 @@ fn save_current() {
                 .enqueue(t.url);
         }
     });
+    repaint_list();
     repaint();
 }
 
@@ -990,6 +1014,7 @@ fn on_library(url: String, r: std::result::Result<Printed, String>) {
         }
         a.show_toast("Saved", false);
     });
+    repaint_list();
     repaint();
 }
 
@@ -1038,7 +1063,7 @@ fn on_player(ev: Event) {
     let mut advance = false;
     with(|a| match ev {
         Event::Title(t) => {
-            if !t.is_empty() && !t.starts_with("watch?") {
+            if !a.local && !t.is_empty() && !t.starts_with("watch?") {
                 a.now_title = t;
             }
         }
@@ -1235,6 +1260,43 @@ fn player_hits(a: &App) -> PlayerHits {
     }
 }
 
+/// The small heart on a result or Up next row: accent when saved, dim while
+/// queued or downloading, nothing otherwise.
+fn row_heart(a: &App, t: &Track) -> Option<COLORREF> {
+    if library::is_saved(&a.lib, t) {
+        Some(ACCENT)
+    } else if a.saving.contains(&t.url) {
+        Some(DIM)
+    } else {
+        None
+    }
+}
+
+/// Draw `row_heart` at the right end of a meta line and return the meta line
+/// narrowed so its text stops short of it.
+fn paint_row_heart(a: &App, hdc: HDC, t: &Track, meta: RECT) -> RECT {
+    let Some(color) = row_heart(a, t) else {
+        return meta;
+    };
+    let w = a.s(18);
+    let heart = RECT {
+        left: meta.right - w,
+        ..meta
+    };
+    text(
+        hdc,
+        G_HEART_FILL,
+        heart,
+        a.fonts.icons,
+        color,
+        DT_SINGLELINE | DT_RIGHT | DT_VCENTER,
+    );
+    RECT {
+        right: heart.left - a.s(4),
+        ..meta
+    }
+}
+
 fn paint_player(a: &App, hdc: HDC, rc: RECT) {
     unsafe {
         let s = |v| a.s(v);
@@ -1391,6 +1453,7 @@ fn paint_player(a: &App, hdc: HDC, rc: RECT) {
                 bottom: r.bottom - s(3),
             };
             text(hdc, &t.title, title, a.fonts.title, TEXT, LINE);
+            let meta = paint_row_heart(a, hdc, t, meta);
             text(hdc, &t.meta(), meta, a.fonts.meta, DIM, LINE);
         }
 
@@ -1483,7 +1546,7 @@ fn draw_item(a: &App, dis: &DRAWITEMSTRUCT) {
         let Some(t) = a.results.get(dis.itemID as usize) else {
             return;
         };
-        let playing = a.current().is_some_and(|c| c.url == t.url);
+        let playing = a.current().is_some_and(|c| c.is_same(t));
         if playing {
             let bar = RECT {
                 left: rc.left,
@@ -1519,6 +1582,7 @@ fn draw_item(a: &App, dis: &DRAWITEMSTRUCT) {
             right: rc.right - a.s(10),
             bottom: rc.bottom - a.s(3),
         };
+        let meta_rc = paint_row_heart(a, hdc, t, meta_rc);
         text(hdc, &t.meta(), meta_rc, a.fonts.meta, DIM, LINE);
     }
 }
