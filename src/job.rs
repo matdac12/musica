@@ -1,6 +1,7 @@
-//! One process-wide kill-on-close job object. Every child musica spawns (mpv,
-//! the yt-dlp downloads) joins it, so none outlives musica however it dies:
-//! the job handle closes with the process and Windows kills the members.
+//! One process-wide kill-on-close job object. Children that call `join` (mpv
+//! today, the yt-dlp downloads next) never outlive musica however it dies: the
+//! job handle closes with the process and Windows kills the members. Search's
+//! short-lived yt-dlp does not join.
 
 use std::os::windows::io::AsRawHandle;
 use std::process::Child;
