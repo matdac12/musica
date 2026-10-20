@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use windows::core::{w, Result, PCWSTR};
 use windows::Win32::Foundation::{
-    GetLastError, COLORREF, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    GetLastError, COLORREF, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -19,8 +19,9 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    keybd_event, GetFocus, SetFocus, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_DOWN, VK_ESCAPE,
-    VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
+    keybd_event, GetAsyncKeyState, GetFocus, SetFocus, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+    VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_SHIFT,
+    VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -30,8 +31,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::launch::{class, mutex, WM_QUIT_RESIDENT, WM_SHOW, WM_TOGGLE};
 use crate::log::log;
-use crate::player::{Event, Player};
+use crate::player::{self, Event, Player};
 use crate::search::{self, fmt_secs, Track};
+use crate::settings::{self, Settings};
 
 const WM_TRAY: u32 = WM_APP + 10;
 const WM_RESULTS: u32 = WM_APP + 11;
@@ -124,7 +126,10 @@ struct App {
     paused: bool,
     pos: f64,
     mpv_duration: Option<f64>,
-    volume: f64,
+    /// App volume level 0..=100 (not mpv's volume); see `player::volume_for_level`.
+    level: i32,
+    /// What is on disk, so border presses don't rewrite the file.
+    saved_level: i32,
     volume_flash: Option<Instant>,
     player: Player,
 }
@@ -267,19 +272,23 @@ unsafe fn run_inner(show: bool) -> Result<i32> {
         )?;
 
         let hwnd_raw = hwnd.0 as isize;
-        let player = Player::new(Box::new(move |ev: Event| {
-            let ptr = Box::into_raw(Box::new(ev));
-            if PostMessageW(
-                Some(HWND(hwnd_raw as _)),
-                WM_PLAYER,
-                WPARAM(0),
-                LPARAM(ptr as isize),
-            )
-            .is_err()
-            {
-                drop(Box::from_raw(ptr));
-            }
-        }));
+        let settings = settings::load();
+        let player = Player::new(
+            Box::new(move |ev: Event| {
+                let ptr = Box::into_raw(Box::new(ev));
+                if PostMessageW(
+                    Some(HWND(hwnd_raw as _)),
+                    WM_PLAYER,
+                    WPARAM(0),
+                    LPARAM(ptr as isize),
+                )
+                .is_err()
+                {
+                    drop(Box::from_raw(ptr));
+                }
+            }),
+            settings.level,
+        );
         let app = App {
             hwnd,
             edit,
@@ -302,7 +311,8 @@ unsafe fn run_inner(show: bool) -> Result<i32> {
             paused: false,
             pos: 0.0,
             mpv_duration: None,
-            volume: 100.0,
+            level: settings.level,
+            saved_level: settings.level,
             volume_flash: None,
             player,
         };
@@ -539,11 +549,74 @@ fn repaint_list() {
     }
 }
 
-fn change_volume(delta: i32) {
-    with(|a| {
-        a.player.add_volume(delta);
+/// A modifier as held *now*. `GetAsyncKeyState`, not `GetKeyState`, so the
+/// state does not depend on which control's queue holds the key message.
+fn held(key: VIRTUAL_KEY) -> bool {
+    unsafe { GetAsyncKeyState(key.0 as i32) < 0 }
+}
+
+/// Plain arrows step 2 levels; Shift makes it 10.
+fn step() -> i32 {
+    if held(VK_SHIFT) {
+        10
+    } else {
+        2
+    }
+}
+
+/// Step the app level in either view, show the toast and save at once: the
+/// level is the only thing standing between a restart and full volume.
+fn change_level(delta: i32) {
+    let save = with(|a| {
+        a.level = (a.level + delta).clamp(0, 100);
+        a.player.set_level(a.level);
         a.volume_flash = Some(Instant::now() + Duration::from_millis(1500));
-    });
+        if a.level != a.saved_level {
+            a.saved_level = a.level;
+            Some(a.level)
+        } else {
+            None
+        }
+    })
+    .flatten();
+    if let Some(level) = save {
+        settings::save(&Settings { level });
+    }
+    repaint();
+}
+
+fn volume_text(level: i32) -> String {
+    match player::db_for_level(level) {
+        Some(db) => format!("Volume {level}%  {db:.1} dB"),
+        None => format!("Volume {level}%  silent"),
+    }
+}
+
+/// Footer-size toast: the level always, the dB only when it fits.
+fn volume_text_fitted(level: i32, room: i32, hdc: HDC, font: HFONT) -> String {
+    let full = volume_text(level);
+    if room > 0 && text_width(hdc, &full, font) <= room {
+        full
+    } else {
+        format!("Volume {level}%")
+    }
+}
+
+fn volume_toast(a: &App) -> Option<String> {
+    a.volume_flash
+        .filter(|until| Instant::now() < *until)
+        .map(|_| volume_text(a.level))
+}
+
+fn text_width(hdc: HDC, s: &str, font: HFONT) -> i32 {
+    unsafe {
+        let old = SelectObject(hdc, font.into());
+        let mut size = SIZE::default();
+        let units: Vec<u16> = s.encode_utf16().collect();
+        let _ = GetTextExtentPoint32W(hdc, &units, &mut size);
+        SelectObject(hdc, old);
+        size.cx
+    }
 }
 
 /// Keys handled before the controls see them. Returns true when consumed.
@@ -583,11 +656,11 @@ fn pretranslate(msg: &MSG) -> bool {
                     true
                 }
                 k if k == VK_UP.0 => {
-                    change_volume(5);
+                    change_level(step());
                     true
                 }
                 k if k == VK_DOWN.0 => {
-                    change_volume(-5);
+                    change_level(-step());
                     true
                 }
                 k if k == VK_TAB.0 => {
@@ -611,6 +684,12 @@ fn pretranslate(msg: &MSG) -> bool {
                 return false;
             }
             let key = msg.wParam.0 as u16;
+            // ↑/↓ already move the result selection, so volume here is
+            // Ctrl+↑/↓ (Ctrl+Shift for ±10), in the box and in the list.
+            if (key == VK_UP.0 || key == VK_DOWN.0) && held(VK_CONTROL) {
+                change_level(if key == VK_UP.0 { step() } else { -step() });
+                return true;
+            }
             match key {
                 k if k == VK_ESCAPE.0 || k == VK_TAB.0 => {
                     if playing {
@@ -852,7 +931,6 @@ fn on_player(ev: Event) {
                 a.playing = false;
             }
         }
-        Event::Volume(v) => a.volume = v,
         Event::Duration(d) => a.mpv_duration = d,
         Event::Pos(p) => a.pos = p,
         Event::Eof => advance = a.qi + 1 < a.queue.len(),
@@ -878,6 +956,11 @@ fn on_player(ev: Event) {
 // ---------------------------------------------------------------- painting
 
 fn text(hdc: HDC, s: &str, rc: RECT, font: HFONT, color: COLORREF, flags: DRAW_TEXT_FORMAT) {
+    // DrawTextW gets a dangling pointer for an empty slice (a pasted link has
+    // no channel), which crashes in user32 even with a zero length.
+    if s.is_empty() {
+        return;
+    }
     unsafe {
         let mut r = rc;
         SelectObject(hdc, font.into());
@@ -913,6 +996,9 @@ fn status_rect(a: &App) -> RECT {
 }
 
 fn status(a: &App) -> (String, COLORREF) {
+    if let Some(toast) = volume_toast(a) {
+        return (toast, ACCENT);
+    }
     if let Some(e) = &a.error {
         return (e.clone(), ERR);
     }
@@ -930,7 +1016,7 @@ fn status(a: &App) -> (String, COLORREF) {
         );
     }
     (
-        "Enter search · ↓ results · Enter play · Esc hide".into(),
+        "Enter search · ↓ results · Ctrl+↑↓ volume · Esc hide".into(),
         DIM,
     )
 }
@@ -1162,17 +1248,13 @@ fn paint_player(a: &App, hdc: HDC, rc: RECT) {
         };
         FillRect(hdc, &rule, a.brushes[B_RULE]);
         let foot = line(FOOT_Y + 1, 34);
-        text(
-            hdc,
-            "Space pause    ← →  prev / next    ↑ ↓  volume    Tab search",
-            foot,
-            a.fonts.meta,
-            DIM,
-            LINE | DT_VCENTER,
-        );
-        let right = match a.volume_flash {
-            Some(until) if Instant::now() < until => {
-                (format!("Volume {}%", a.volume.round() as i32), ACCENT)
+        const HINT: &str = "Space pause · ←→ tracks · ↑↓ volume  Shift ±10 · Tab search";
+        text(hdc, HINT, foot, a.fonts.meta, DIM, LINE | DT_VCENTER);
+        let right = match volume_toast(a) {
+            Some(_) => {
+                // Leave room for the hint; drop the dB when it would overlap.
+                let room = (rc.right - s(P)) - (s(P) + text_width(hdc, HINT, a.fonts.meta) + s(12));
+                (volume_text_fitted(a.level, room, hdc, a.fonts.meta), ACCENT)
             }
             _ => ("type to search".to_string(), DIM),
         };

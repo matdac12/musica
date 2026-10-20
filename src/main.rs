@@ -4,6 +4,7 @@ mod launch;
 mod log;
 mod player;
 mod search;
+mod settings;
 mod tools;
 mod ui;
 
