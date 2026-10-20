@@ -408,12 +408,36 @@ fn file_name(p: &Printed) -> Result<String, String> {
     Ok(format!("{id}.{ext}"))
 }
 
+/// `<stem>.orphan.<ext>`, or with `.2`, `.3`... until the name is free.
+fn free_aside(dest: &Path) -> PathBuf {
+    let stem = dest.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = dest.extension().unwrap_or_default().to_string_lossy();
+    (1u32..)
+        .map(|n| {
+            let tag = if n == 1 { String::new() } else { format!(".{n}") };
+            dest.with_file_name(format!("{stem}.orphan{tag}.{ext}"))
+        })
+        .find(|p| !p.exists())
+        .expect("u32 range exhausted")
+}
+
 /// Move a finished download into `library\` and build its entry. The caller
 /// adds the entry to the index and writes it.
 pub fn finalize(root: &Path, p: &Printed, saved_at: String) -> Result<Entry, String> {
     let file = file_name(p)?;
     let dest = audio_dir(root).join(&file);
     std::fs::create_dir_all(audio_dir(root)).map_err(|e| e.to_string())?;
+    // Orphans are never deleted (spec decision 14), and a rename replaces its
+    // target: move a file already at `dest` aside first, then log it.
+    if dest.exists() {
+        let aside = free_aside(&dest);
+        std::fs::rename(&dest, &aside)
+            .map_err(|e| format!("could not set the existing file aside: {e}"))?;
+        log(format!(
+            "library: {file} already on disk without an entry, kept as {}",
+            aside.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    }
     std::fs::rename(&p.filepath, &dest).map_err(|e| format!("could not move the file: {e}"))?;
     let bytes = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
     Ok(Entry {
@@ -439,23 +463,47 @@ pub fn iso((y, mo, d, h, mi, s): (u16, u16, u16, u16, u16, u16), offset_minutes:
     )
 }
 
+/// Minutes east of UTC from `GetTimeZoneInformation`'s return value and
+/// biases (all minutes west). `None` for `TIME_ZONE_ID_INVALID` or anything
+/// unknown: the biases mean nothing then.
+fn offset_from_zone(id: u32, bias: i32, standard: i32, daylight: i32) -> Option<i32> {
+    match id {
+        0 | 1 => Some(-(bias + standard)), // UNKNOWN (no DST rules) / STANDARD
+        2 => Some(-(bias + daylight)),     // DAYLIGHT
+        _ => None,
+    }
+}
+
 /// Local time now, with the current UTC offset (daylight saving included).
 pub fn now_iso() -> String {
-    use windows::Win32::System::SystemInformation::GetLocalTime;
-    use windows::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
+    use windows::Win32::System::Time::{
+        GetTimeZoneInformation, SystemTimeToFileTime, TIME_ZONE_INFORMATION,
+    };
     unsafe {
         let t = GetLocalTime();
         let mut tz = TIME_ZONE_INFORMATION::default();
-        let daylight = GetTimeZoneInformation(&mut tz) == 2; // TIME_ZONE_ID_DAYLIGHT
-        let bias = tz.Bias
-            + if daylight {
-                tz.DaylightBias
-            } else {
-                tz.StandardBias
-            };
+        let id = GetTimeZoneInformation(&mut tz);
+        let offset = offset_from_zone(id, tz.Bias, tz.StandardBias, tz.DaylightBias)
+            .unwrap_or_else(|| {
+                // No usable zone: the difference between the local and UTC
+                // clocks, read at the same moment, is the offset.
+                let ticks = |st| {
+                    let mut ft = FILETIME::default();
+                    SystemTimeToFileTime(&st, &mut ft).ok()?;
+                    Some((ft.dwHighDateTime as i64) << 32 | ft.dwLowDateTime as i64)
+                };
+                match (ticks(t), ticks(GetSystemTime())) {
+                    // 100 ns ticks; round to the nearest minute (the two
+                    // reads can straddle a second).
+                    (Some(l), Some(u)) => ((l - u) as f64 / 600_000_000.0).round() as i32,
+                    _ => 0,
+                }
+            });
         iso(
             (t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond),
-            -bias,
+            offset,
         )
     }
 }
@@ -591,6 +639,42 @@ mod tests {
         assert!(!src.exists());
         assert!(audio_dir(&root).join("a1.webm").is_file());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn finalize_keeps_an_existing_orphan() {
+        let root = scratch("orphan");
+        std::fs::create_dir_all(partial_dir(&root)).unwrap();
+        std::fs::create_dir_all(audio_dir(&root)).unwrap();
+        std::fs::write(audio_dir(&root).join("a1.webm"), b"old").unwrap();
+        std::fs::write(audio_dir(&root).join("a1.orphan.webm"), b"older").unwrap();
+        let src = partial_dir(&root).join("a1.webm");
+        std::fs::write(&src, b"new!").unwrap();
+        let p = Printed {
+            id: "a1".into(),
+            title: "T".into(),
+            url: "u".into(),
+            channel: "C".into(),
+            duration: 5,
+            ext: "webm".into(),
+            filepath: src,
+        };
+        let e = finalize(&root, &p, "now".into()).unwrap();
+        assert_eq!(e.bytes, 4);
+        let read = |n: &str| std::fs::read(audio_dir(&root).join(n)).unwrap();
+        assert_eq!(read("a1.webm"), b"new!");
+        assert_eq!(read("a1.orphan.2.webm"), b"old");
+        assert_eq!(read("a1.orphan.webm"), b"older");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn zone_offsets() {
+        // Rome: bias -60, daylight -60 more.
+        assert_eq!(offset_from_zone(1, -60, 0, -60), Some(60));
+        assert_eq!(offset_from_zone(2, -60, 0, -60), Some(120));
+        assert_eq!(offset_from_zone(0, -60, 0, -60), Some(60));
+        assert_eq!(offset_from_zone(0xFFFF_FFFF, -60, 0, -60), None);
     }
 
     #[test]
