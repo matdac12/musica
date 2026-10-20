@@ -20,8 +20,8 @@ use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_SELECT
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, GetAsyncKeyState, GetFocus, SetFocus, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-    VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_S,
-    VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_S,
+    VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VK_Z,
 };
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -122,6 +122,19 @@ struct Toast {
     until: Instant,
 }
 
+/// The one undo slot: the last removed entry, until `until` or the next removal.
+struct Undo {
+    entry: Entry,
+    /// Index position it had in `App::lib`.
+    pos: usize,
+    /// Its file waits in `.trash\`.
+    trashed: bool,
+    until: Instant,
+}
+
+/// How long the removal toast, and so the undo, lasts.
+const UNDO_FOR: Duration = Duration::from_millis(5000);
+
 struct App {
     hwnd: HWND,
     edit: HWND,
@@ -171,6 +184,9 @@ struct App {
     saving: Vec<String>,
     downloader: Option<Downloader>,
     toast: Option<Toast>,
+    undo: Option<Undo>,
+    /// Files of removed entries that mpv still has open: deleted once it lets go.
+    held: Vec<String>,
 }
 
 // Indexes into `App::brushes`.
@@ -230,11 +246,33 @@ impl App {
     }
 
     fn show_toast(&mut self, text: impl Into<String>, error: bool) {
+        self.toast_for(text, error, Duration::from_millis(4000));
+    }
+
+    fn toast_for(&mut self, text: impl Into<String>, error: bool, dur: Duration) {
         self.toast = Some(Toast {
             text: text.into(),
             error,
-            until: Instant::now() + Duration::from_millis(4000),
+            until: Instant::now() + dur,
         });
+    }
+
+    /// The undo window is over: the trashed file goes for good.
+    fn expire_undo(&mut self) {
+        if let Some(u) = self.undo.take() {
+            if u.trashed {
+                library::discard_trashed(&self.lib_root, &u.entry.file);
+            }
+        }
+    }
+
+    /// Delete the files mpv held, as far as it has let go of them.
+    fn release_held(&mut self) {
+        let (root, lib) = (&self.lib_root, &self.lib);
+        // A file whose entry still sits in the undo slot is not let go yet.
+        let pending = self.undo.as_ref().map(|u| u.entry.file.as_str());
+        self.held
+            .retain(|f| Some(f.as_str()) == pending || !library::delete_held(root, lib, f));
     }
 }
 
@@ -401,6 +439,8 @@ unsafe fn run_inner(show: bool) -> Result<i32> {
             saving: Vec::new(),
             downloader: None,
             toast: None,
+            undo: None,
+            held: Vec::new(),
         };
         APP.with(|a| *a.borrow_mut() = Some(app));
         sync_list();
@@ -775,6 +815,14 @@ fn pretranslate(msg: &MSG) -> bool {
                 return true;
             }
             match key {
+                k if k == VK_Z.0 && held(VK_CONTROL) && undo_pending() => {
+                    undo_remove();
+                    true
+                }
+                k if k == VK_DELETE.0 && msg.hwnd == list => {
+                    remove_selected();
+                    true
+                }
                 k if k == VK_ESCAPE.0 || k == VK_TAB.0 => {
                     if playing {
                         set_view(View::Player, false);
@@ -1025,6 +1073,116 @@ fn play_current() {
     repaint_list();
     repaint();
     tray(NIM_MODIFY);
+}
+
+fn undo_pending() -> bool {
+    with(|a| a.undo.as_ref().is_some_and(|u| Instant::now() < u.until)) == Some(true)
+}
+
+/// Move the list's selection to row `i` (or the last row), after the rows
+/// were rebuilt.
+fn select_row(i: usize) {
+    let Some((list, n)) = with(|a| (a.list, a.rows())) else {
+        return;
+    };
+    if n > 0 {
+        unsafe {
+            SendMessageW(list, LB_SETCURSEL, Some(WPARAM(i.min(n - 1))), None);
+        }
+    }
+    repaint_list();
+}
+
+/// Del on a library row: the entry and its file go, with one step of undo.
+/// The queue holds copies, so a playing track carries on.
+fn remove_selected() {
+    let Some((list, library)) = with(|a| (a.list, a.source == Source::Library)) else {
+        return;
+    };
+    let row = unsafe { SendMessageW(list, LB_GETCURSEL, None, None).0 };
+    if !library || row < 0 {
+        return;
+    }
+    let row = row as usize;
+    let done = with(|a| {
+        let pos = *a.view_idx.get(row)?;
+        let entry = a.lib.remove(pos);
+        if let Err(e) = library::save(&a.lib_root, &a.lib) {
+            log(format!("could not write the index: {e}"));
+            a.lib.insert(pos, entry);
+            a.show_toast(format!("Couldn't remove: {e}"), true);
+            return Some(false);
+        }
+        a.expire_undo(); // the previous removal's window ends here
+        let trashed = library::trash_file(&a.lib_root, &entry.file);
+        if trashed == library::Trashed::Held {
+            a.held.push(entry.file.clone());
+        }
+        log(format!("removed {} ({trashed:?})", entry.id));
+        a.toast_for(
+            format!("Removed \"{}\" · Ctrl+Z to undo", entry.title),
+            false,
+            UNDO_FOR,
+        );
+        a.undo = Some(Undo {
+            trashed: trashed == library::Trashed::Moved,
+            pos,
+            entry,
+            until: Instant::now() + UNDO_FOR,
+        });
+        Some(true)
+    })
+    .flatten();
+    if done == Some(true) {
+        sync_list();
+        select_row(row);
+    } else {
+        repaint();
+    }
+}
+
+/// Ctrl+Z inside the window: the entry comes back at its old position, with
+/// its file.
+fn undo_remove() {
+    let row = with(|a| {
+        let u = a.undo.take()?;
+        if a.lib.iter().any(|e| e.id == u.entry.id) {
+            // Saved again meanwhile: the old copy is not needed.
+            if u.trashed {
+                library::discard_trashed(&a.lib_root, &u.entry.file);
+            }
+            a.show_toast("Already saved", false);
+            return None;
+        }
+        if u.trashed {
+            if let Err(e) = library::restore_file(&a.lib_root, &u.entry.file) {
+                log(format!("undo: could not restore {}: {e}", u.entry.file));
+                a.show_toast(format!("Couldn't undo: {e}"), true);
+                a.undo = Some(u); // the window stays: Ctrl+Z can retry
+                return None;
+            }
+        } else {
+            a.held.retain(|f| *f != u.entry.file);
+            library::unmark(&a.lib_root, &u.entry.file);
+        }
+        let pos = u.pos.min(a.lib.len());
+        a.lib.insert(pos, u.entry);
+        if let Err(e) = library::save(&a.lib_root, &a.lib) {
+            log(format!("could not write the index: {e}"));
+            a.show_toast(format!("Restored, but the index didn't save: {e}"), true);
+        } else {
+            a.show_toast("Restored", false);
+        }
+        Some(pos)
+    })
+    .flatten();
+    sync_list();
+    if let Some(pos) = row {
+        let shown = with(|a| a.view_idx.iter().position(|&i| i == pos)).flatten();
+        if let Some(r) = shown {
+            select_row(r);
+        }
+    }
 }
 
 /// Save the playing track: queue a download. Never a toggle.
@@ -1927,6 +2085,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         a.player.query_pos();
                     }
                     let now = Instant::now();
+                    if a.undo.as_ref().is_some_and(|u| now >= u.until) {
+                        a.expire_undo();
+                    }
+                    if !a.held.is_empty() {
+                        a.release_held();
+                    }
                     let toast_done = a.toast.as_ref().is_some_and(|t| now >= t.until);
                     if toast_done {
                         a.toast = None;

@@ -103,11 +103,104 @@ pub fn save(root: &Path, entries: &[Entry]) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
-/// Startup: empty `.partial\` and `.trash\` (interrupted downloads, removed
-/// files), and log the files in `library\` that the index does not name.
-/// Orphans are never deleted. Returns them for the caller and the tests.
+/// Where a removed entry's file went.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Trashed {
+    /// Moved to `.trash\`: undo moves it back.
+    Moved,
+    /// Not on disk (the row said "File missing"): nothing to hold.
+    Missing,
+    /// Still in `library\`, in use (mpv has it open). A `.del` marker in
+    /// `.trash\` tells the next startup to delete it.
+    Held,
+}
+
+/// A file name with no folder part: the only kind that is ever moved or deleted.
+fn plain(file: &str) -> bool {
+    !file.is_empty() && Path::new(file).file_name().is_some_and(|n| n == file)
+}
+
+fn marker(root: &Path, file: &str) -> PathBuf {
+    trash_dir(root).join(format!("{file}.del"))
+}
+
+/// Move an entry's file to `.trash\` (replacing an older file of that name).
+pub fn trash_file(root: &Path, file: &str) -> Trashed {
+    if !plain(file) {
+        return Trashed::Missing;
+    }
+    let from = audio_dir(root).join(file);
+    if !from.is_file() {
+        return Trashed::Missing;
+    }
+    let to = trash_dir(root).join(file);
+    let moved = std::fs::create_dir_all(trash_dir(root))
+        .and_then(|()| std::fs::rename(&from, &to))
+        .is_ok();
+    if moved {
+        return Trashed::Moved;
+    }
+    log(format!("library: {file} is in use, kept for a later delete"));
+    let _ = std::fs::write(marker(root, file), "");
+    Trashed::Held
+}
+
+/// Undo: move a trashed file back into `library\`.
+pub fn restore_file(root: &Path, file: &str) -> Result<(), String> {
+    if !plain(file) {
+        return Err("bad file name".into());
+    }
+    std::fs::rename(trash_dir(root).join(file), audio_dir(root).join(file))
+        .map_err(|e| e.to_string())
+}
+
+/// The undo window is over: delete the trashed file.
+pub fn discard_trashed(root: &Path, file: &str) {
+    if plain(file) {
+        let _ = std::fs::remove_file(trash_dir(root).join(file));
+    }
+}
+
+/// Undo of a held file: it never left, so only the marker goes.
+pub fn unmark(root: &Path, file: &str) {
+    if plain(file) {
+        let _ = std::fs::remove_file(marker(root, file));
+    }
+}
+
+/// Try to delete a held file. True once it is settled: deleted, already gone,
+/// or taken over by a new entry of the same name (then it is not ours to delete).
+pub fn delete_held(root: &Path, entries: &[Entry], file: &str) -> bool {
+    if !plain(file) {
+        return true;
+    }
+    if entries.iter().any(|e| e.file == file) {
+        unmark(root, file);
+        return true;
+    }
+    match std::fs::remove_file(audio_dir(root).join(file)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return false,
+    }
+    unmark(root, file);
+    true
+}
+
+/// Startup: delete the files marked in `.trash\`, empty `.partial\` and
+/// `.trash\` (interrupted downloads, removed files), and log the files in
+/// `library\` that the index does not name. Orphans are never deleted.
+/// Returns them for the caller and the tests.
 pub fn sweep(root: &Path, entries: &[Entry]) -> Vec<String> {
     clear_dir(&partial_dir(root));
+    if let Ok(items) = std::fs::read_dir(trash_dir(root)) {
+        for item in items.flatten() {
+            let name = item.file_name().to_string_lossy().into_owned();
+            if let Some(file) = name.strip_suffix(".del") {
+                delete_held(root, entries, file);
+            }
+        }
+    }
     clear_dir(&trash_dir(root));
     let mut orphans = Vec::new();
     if let Ok(dir) = std::fs::read_dir(audio_dir(root)) {
@@ -523,6 +616,87 @@ mod tests {
         assert_eq!(std::fs::read_dir(trash_dir(&root)).unwrap().count(), 0);
         assert!(audio_dir(&root).join("stray.webm").is_file());
         assert!(audio_dir(&root).join("a.webm").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn put(root: &Path, file: &str) {
+        std::fs::create_dir_all(audio_dir(root)).unwrap();
+        std::fs::write(audio_dir(root).join(file), "x").unwrap();
+    }
+
+    #[test]
+    fn trash_then_restore_or_discard() {
+        let root = scratch("trash");
+        put(&root, "a.webm");
+        assert_eq!(trash_file(&root, "a.webm"), Trashed::Moved);
+        assert!(!audio_dir(&root).join("a.webm").exists());
+        assert!(trash_dir(&root).join("a.webm").is_file());
+        restore_file(&root, "a.webm").unwrap();
+        assert!(audio_dir(&root).join("a.webm").is_file());
+        // A second trash replaces an older file of the same name, then goes.
+        std::fs::create_dir_all(trash_dir(&root)).unwrap();
+        std::fs::write(trash_dir(&root).join("a.webm"), "old").unwrap();
+        assert_eq!(trash_file(&root, "a.webm"), Trashed::Moved);
+        discard_trashed(&root, "a.webm");
+        assert!(!trash_dir(&root).join("a.webm").exists());
+        // A file that is not there, or a name with a folder in it.
+        assert_eq!(trash_file(&root, "nope.webm"), Trashed::Missing);
+        assert_eq!(trash_file(&root, "..\\library.json"), Trashed::Missing);
+        assert!(restore_file(&root, "..\\x").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_file_in_use_is_held_and_deleted_later() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = scratch("held");
+        put(&root, "a.webm");
+        let path = audio_dir(&root).join("a.webm");
+        // Share read only: no delete, no rename, like mpv's open file.
+        let open = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        assert_eq!(trash_file(&root, "a.webm"), Trashed::Held);
+        assert!(path.is_file());
+        assert!(marker(&root, "a.webm").is_file());
+        assert!(!delete_held(&root, &[], "a.webm"));
+        drop(open);
+        assert!(delete_held(&root, &[], "a.webm"));
+        assert!(!path.exists());
+        assert!(!marker(&root, "a.webm").exists());
+        // Gone already counts as settled.
+        assert!(delete_held(&root, &[], "a.webm"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_held_file_taken_over_by_a_new_entry_is_not_deleted() {
+        let root = scratch("retaken");
+        put(&root, "a.webm");
+        let _ = std::fs::create_dir_all(trash_dir(&root));
+        std::fs::write(marker(&root, "a.webm"), "").unwrap();
+        assert!(delete_held(&root, &[entry("a")], "a.webm"));
+        assert!(audio_dir(&root).join("a.webm").is_file());
+        assert!(!marker(&root, "a.webm").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sweep_deletes_marked_files_but_not_orphans_or_entries() {
+        let root = scratch("sweepdel");
+        put(&root, "held.webm");
+        put(&root, "kept.webm");
+        put(&root, "stray.webm");
+        std::fs::create_dir_all(trash_dir(&root)).unwrap();
+        std::fs::write(marker(&root, "held.webm"), "").unwrap();
+        std::fs::write(trash_dir(&root).join("undone.webm"), "x").unwrap();
+        let orphans = sweep(&root, &[entry("kept")]);
+        assert_eq!(orphans, vec!["stray.webm".to_string()]);
+        assert!(!audio_dir(&root).join("held.webm").exists());
+        assert!(audio_dir(&root).join("kept.webm").is_file());
+        assert_eq!(std::fs::read_dir(trash_dir(&root)).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 

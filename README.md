@@ -47,6 +47,8 @@ plays.
 | ↓ / ↑ | Into the list / back to the search box |
 | Enter, double-click (in the list) | Play the list as shown, from the selected row, and open the player |
 | Shift+Enter (library list) | Play the library list shuffled, the selected track first |
+| Del (in the list, library rows) | Remove the track and its file, no dialog |
+| Ctrl+Z | Undo the removal for 5 s; otherwise the box's own text undo |
 | Ctrl+↑ / Ctrl+↓ | Volume (Ctrl+Shift for ±10) |
 | Space | Pause / resume (in the list) |
 | Esc, Tab | Back to the player (Esc hides when nothing plays) |
@@ -89,6 +91,18 @@ tracks · 1.4 GB").
   URL.
 - **Offline:** if the YouTube search fails, the list shows the saved tracks that
   match the query, with "YouTube search failed · showing saved matches".
+
+### Removing
+
+**Del** on a library row removes the track: its entry and its file, with no
+dialog. The status line says `Removed "<title>" · Ctrl+Z to undo` for 5 s;
+**Ctrl+Z** in that time puts it back at the same position, file and all.
+Otherwise Ctrl+Z stays the search box's text undo. The file waits in
+`library\.trash\` until the window ends or the next removal, then is deleted
+(startup clears anything left). Removing the track that is playing doesn't
+interrupt it; if Windows won't release its file, it is deleted as soon as mpv
+lets go, or at the next start. Removal is not on the player: Ctrl+S and the
+heart only save.
 
 The tray icon: left-click toggles the popup; right-click has Pause, Next, Stop and Quit.
 The log is `%LOCALAPPDATA%\Musica\musica.log`.
