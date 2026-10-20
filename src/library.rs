@@ -154,6 +154,78 @@ pub fn find<'a>(entries: &'a [Entry], track: &Track) -> Option<&'a Entry> {
     }
 }
 
+impl Entry {
+    /// The queue form of a saved entry. A zero length (yt-dlp gave none) is
+    /// left to mpv, like a pasted link, rather than shown as live.
+    pub fn track(&self) -> Track {
+        Track {
+            title: self.title.clone(),
+            channel: self.channel.clone(),
+            duration: (self.duration > 0).then_some(self.duration),
+            url: self.url.clone(),
+            id: Some(self.id.clone()),
+            from_search: self.duration > 0,
+        }
+    }
+}
+
+/// Positions in `entries` matching `query` (case-insensitive substring of the
+/// title or channel), newest first: the index is in save order. An empty query
+/// matches everything.
+pub fn filter(entries: &[Entry], query: &str) -> Vec<usize> {
+    let q = query.trim().to_lowercase();
+    (0..entries.len())
+        .rev()
+        .filter(|&i| {
+            let e = &entries[i];
+            q.is_empty()
+                || e.title.to_lowercase().contains(&q)
+                || e.channel.to_lowercase().contains(&q)
+        })
+        .collect()
+}
+
+/// Shuffle `items` in place with `items[first]` moved to the front and the
+/// rest in a random order (Fisher–Yates over xorshift64; no `rand`).
+pub fn shuffle_first<T>(items: &mut [T], first: usize, seed: u64) {
+    if items.is_empty() {
+        return;
+    }
+    items.swap(0, first.min(items.len() - 1));
+    let mut x = seed | 1; // xorshift must not start at 0
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    for i in (2..items.len()).rev() {
+        // j in 1..=i
+        let j = 1 + (next() % i as u64) as usize;
+        items.swap(i, j);
+    }
+}
+
+/// A seed that differs from run to run.
+pub fn time_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0x9E37_79B9_7F4A_7C15, |d| d.as_nanos() as u64)
+}
+
+/// "1.4 GB", "312 MB", "48 KB".
+pub fn fmt_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= KB * KB * KB {
+        format!("{:.1} GB", b / (KB * KB * KB))
+    } else if b >= KB * KB {
+        format!("{:.0} MB", b / (KB * KB))
+    } else {
+        format!("{:.0} KB", b / KB)
+    }
+}
+
 /// The saved file to play instead of the URL, with its entry. `None` when the
 /// track is not saved or its file has gone (the caller then streams the URL).
 pub fn local_file<'a>(
@@ -488,6 +560,87 @@ mod tests {
         // Not in the index at all.
         assert!(local_file(&root, &entries, &track(Some("other"), Some(1), true)).is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn named(id: &str, title: &str, channel: &str) -> Entry {
+        Entry {
+            title: title.into(),
+            channel: channel.into(),
+            ..entry(id)
+        }
+    }
+
+    #[test]
+    fn filter_is_case_insensitive_over_title_and_channel_newest_first() {
+        let entries = vec![
+            named("a", "Lofi Beats", "Chill Cow"),
+            named("b", "Rain sounds", "Nature"),
+            named("c", "Jazz", "LOFI girl"),
+        ];
+        // Empty (or blank) query: everything, newest (last saved) first.
+        assert_eq!(filter(&entries, ""), vec![2, 1, 0]);
+        assert_eq!(filter(&entries, "  "), vec![2, 1, 0]);
+        // Title and channel both match, whatever the case.
+        assert_eq!(filter(&entries, "lofi"), vec![2, 0]);
+        assert_eq!(filter(&entries, "LOFI"), vec![2, 0]);
+        // Title only, channel only.
+        assert_eq!(filter(&entries, "rain"), vec![1]);
+        assert_eq!(filter(&entries, "cow"), vec![0]);
+        // A substring, not a prefix; no match is empty.
+        assert_eq!(filter(&entries, "eat"), vec![0]);
+        assert!(filter(&entries, "zzz").is_empty());
+        assert!(filter(&[], "x").is_empty());
+    }
+
+    #[test]
+    fn shuffle_keeps_everything_with_the_selected_first() {
+        for seed in [0, 1, 42, u64::MAX, time_seed()] {
+            for first in [0, 3, 9] {
+                let mut v: Vec<u32> = (0..10).collect();
+                shuffle_first(&mut v, first, seed);
+                assert_eq!(v[0], first as u32);
+                let mut sorted = v.clone();
+                sorted.sort_unstable();
+                assert_eq!(sorted, (0..10).collect::<Vec<u32>>());
+            }
+        }
+        // It does reorder the rest (some seed differs from the identity).
+        let moved = (1..20u64).any(|seed| {
+            let mut v: Vec<u32> = (0..10).collect();
+            shuffle_first(&mut v, 0, seed);
+            v != (0..10).collect::<Vec<u32>>()
+        });
+        assert!(moved);
+        // Tiny inputs.
+        let mut none: Vec<u32> = Vec::new();
+        shuffle_first(&mut none, 0, 1);
+        let mut one = vec![7];
+        shuffle_first(&mut one, 0, 1);
+        assert_eq!(one, vec![7]);
+        let mut two = vec![1, 2];
+        shuffle_first(&mut two, 1, 5);
+        assert_eq!(two, vec![2, 1]);
+    }
+
+    #[test]
+    fn entry_track_keeps_id_and_leaves_zero_length_to_mpv() {
+        let t = entry("abc").track();
+        assert_eq!(t.id.as_deref(), Some("abc"));
+        assert_eq!(t.duration, Some(181));
+        assert!(t.from_search);
+        let mut e = entry("abc");
+        e.duration = 0;
+        let t = e.track();
+        assert_eq!(t.duration, None);
+        assert!(!t.from_search);
+    }
+
+    #[test]
+    fn byte_sizes() {
+        assert_eq!(fmt_bytes(0), "0 KB");
+        assert_eq!(fmt_bytes(48 * 1024), "48 KB");
+        assert_eq!(fmt_bytes(312 * 1024 * 1024), "312 MB");
+        assert_eq!(fmt_bytes(1_503_238_554), "1.4 GB");
     }
 
     #[test]

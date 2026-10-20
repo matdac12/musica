@@ -99,6 +99,14 @@ enum View {
     Player,
 }
 
+/// What the Search view's list shows: the saved library (filtered by the box)
+/// or the last YouTube search.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Source {
+    Library,
+    Results,
+}
+
 struct Fonts {
     search: HFONT,
     big: HFONT,
@@ -125,7 +133,12 @@ struct App {
     taskbar_created: u32,
     view: View,
     // Search.
+    source: Source,
     results: Vec<Track>,
+    /// Library positions shown, newest first, filtered by `query`.
+    view_idx: Vec<usize>,
+    /// The box text (trimmed) the library view was last filtered with.
+    query: String,
     seq: u64,
     searching: bool,
     error: Option<String>,
@@ -188,6 +201,27 @@ impl App {
             t.duration.map(|d| d as f64)
         } else {
             self.mpv_duration
+        }
+    }
+
+    /// Rows in the Search list.
+    fn rows(&self) -> usize {
+        match self.source {
+            Source::Library => self.view_idx.len(),
+            Source::Results => self.results.len(),
+        }
+    }
+
+    /// The list as shown, as a queue.
+    fn shown(&self) -> Vec<Track> {
+        match self.source {
+            Source::Library => self
+                .view_idx
+                .iter()
+                .filter_map(|&i| self.lib.get(i))
+                .map(Entry::track)
+                .collect(),
+            Source::Results => self.results.clone(),
         }
     }
 
@@ -340,7 +374,10 @@ unsafe fn run_inner(show: bool) -> Result<i32> {
             icon: make_icon(),
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
             view: View::Search,
+            source: Source::Library,
             results: Vec::new(),
+            view_idx: Vec::new(),
+            query: String::new(),
             seq: 0,
             searching: false,
             error: None,
@@ -366,6 +403,7 @@ unsafe fn run_inner(show: bool) -> Result<i32> {
             toast: None,
         };
         APP.with(|a| *a.borrow_mut() = Some(app));
+        sync_list();
         tray(NIM_ADD);
         if show {
             show_popup();
@@ -670,16 +708,9 @@ fn text_width(hdc: HDC, s: &str, font: HFONT) -> i32 {
 
 /// Keys handled before the controls see them. Returns true when consumed.
 fn pretranslate(msg: &MSG) -> bool {
-    let Some((hwnd, edit, list, view, has_results, playing)) = with(|a| {
-        (
-            a.hwnd,
-            a.edit,
-            a.list,
-            a.view,
-            !a.results.is_empty(),
-            a.playing,
-        )
-    }) else {
+    let Some((hwnd, edit, list, view, has_rows, playing)) =
+        with(|a| (a.hwnd, a.edit, a.list, a.view, a.rows() > 0, a.playing))
+    else {
         return false;
     };
     unsafe {
@@ -759,11 +790,11 @@ fn pretranslate(msg: &MSG) -> bool {
                 k if k == VK_RETURN.0 => {
                     let i = SendMessageW(list, LB_GETCURSEL, None, None).0;
                     if i >= 0 {
-                        play_result(i as usize);
+                        play_shown(i as usize, held(VK_SHIFT));
                     }
                     true
                 }
-                k if k == VK_DOWN.0 && msg.hwnd == edit && has_results => {
+                k if k == VK_DOWN.0 && msg.hwnd == edit && has_rows => {
                     let _ = SetFocus(Some(list));
                     if SendMessageW(list, LB_GETCURSEL, None, None).0 < 0 {
                         SendMessageW(list, LB_SETCURSEL, Some(WPARAM(0)), None);
@@ -836,7 +867,7 @@ fn submit() {
 }
 
 fn on_results(seq: u64, r: std::result::Result<Vec<Track>, String>) {
-    let Some(Some((list, n))) = with(|a| {
+    let Some(Some(())) = with(|a| {
         if seq != a.seq {
             return None;
         }
@@ -847,38 +878,96 @@ fn on_results(seq: u64, r: std::result::Result<Vec<Track>, String>) {
                 if v.is_empty() {
                     a.error = Some("No results".into());
                 }
+                a.source = Source::Results;
                 a.results = v;
             }
             Err(e) => {
+                // Offline or broken: show the saved matches instead.
                 log(format!("search #{seq} failed: {e}"));
-                a.error = Some(e);
+                a.error = Some("YouTube search failed · showing saved matches".into());
+                a.source = Source::Library;
                 a.results.clear();
             }
         }
-        Some((a.list, a.results.len()))
+        Some(())
     }) else {
         return;
     };
-    unsafe {
-        SendMessageW(list, LB_SETCOUNT, Some(WPARAM(n)), None);
-        if n > 0 {
+    sync_list();
+    let Some((list, n)) = with(|a| (a.list, a.rows())) else {
+        return;
+    };
+    if n > 0 {
+        unsafe {
             SendMessageW(list, LB_SETCURSEL, Some(WPARAM(0)), None);
             if GetFocus() != list {
                 let _ = SetFocus(Some(list));
             }
         }
+    }
+    repaint_list();
+}
+
+/// Point the list at its source: refilter the library by the box text, set the
+/// row count (which clears the selection).
+fn sync_list() {
+    let Some(edit) = with(|a| a.edit) else { return };
+    let q = edit_text(edit);
+    let Some((list, n)) = with(|a| {
+        if a.source == Source::Library {
+            a.view_idx = library::filter(&a.lib, &q);
+        }
+        a.query = q;
+        (a.list, a.rows())
+    }) else {
+        return;
+    };
+    unsafe {
+        SendMessageW(list, LB_SETCOUNT, Some(WPARAM(n)), None);
         let _ = InvalidateRect(Some(list), None, true);
     }
     repaint();
 }
 
-/// Play result `i`: the results become the queue.
-fn play_result(i: usize) {
-    if let Some(results) = with(|a| a.results.clone()) {
-        if i < results.len() {
-            play_queue(results, i);
+/// The box changed. While the library shows, each keystroke refilters it (no
+/// network). YouTube results stay until the next Enter, unless the box is
+/// emptied: then the library comes back and a search still in flight is dropped.
+fn on_edit_change() {
+    let Some(edit) = with(|a| a.edit) else { return };
+    let empty = edit_text(edit).is_empty();
+    let library = with(|a| {
+        if empty {
+            a.source = Source::Library;
+            a.results = Vec::new();
+            a.error = None;
+            a.seq += 1;
+            a.searching = false;
         }
+        a.source == Source::Library
+    });
+    if library == Some(true) {
+        sync_list();
+    } else {
+        // Results stay; the status line does not use the text.
+        repaint();
     }
+}
+
+/// Play row `i` of the list as shown: it becomes the queue, starting there.
+/// `shuffle` (library only) puts row `i` first and the rest in random order.
+fn play_shown(i: usize, shuffle: bool) {
+    let Some((mut queue, library)) = with(|a| (a.shown(), a.source == Source::Library)) else {
+        return;
+    };
+    if i >= queue.len() {
+        return;
+    }
+    let mut qi = i;
+    if shuffle && library {
+        library::shuffle_first(&mut queue, i, library::time_seed());
+        qi = 0;
+    }
+    play_queue(queue, qi);
 }
 
 fn play_queue(queue: Vec<Track>, qi: usize) {
@@ -1022,8 +1111,13 @@ fn on_library(url: String, r: std::result::Result<Printed, String>) {
         }
         a.show_toast("Saved", false);
     });
-    repaint_list();
-    repaint();
+    // A new entry shifts the library rows; YouTube results are untouched.
+    if with(|a| a.source == Source::Library) == Some(true) {
+        sync_list();
+    } else {
+        repaint_list();
+        repaint();
+    }
 }
 
 fn next() {
@@ -1177,10 +1271,30 @@ fn status(a: &App) -> (String, COLORREF) {
             if a.paused { DIM } else { ACCENT },
         );
     }
+    if a.source == Source::Library {
+        return (library_status(a), DIM);
+    }
     (
         "Enter search · ↓ results · Ctrl+↑↓ volume · Esc hide".into(),
         DIM,
     )
+}
+
+fn library_status(a: &App) -> String {
+    let n = a.view_idx.len();
+    if !a.query.is_empty() {
+        if n == 0 {
+            "No saved match · Enter: search YouTube".into()
+        } else {
+            format!("{n} saved · Enter: search YouTube")
+        }
+    } else if a.lib.is_empty() {
+        "Nothing saved yet · ♥ on the player saves a track".into()
+    } else {
+        let bytes: u64 = a.lib.iter().map(|e| e.bytes).sum();
+        let tracks = if n == 1 { "track" } else { "tracks" };
+        format!("Library · {n} {tracks} · {}", library::fmt_bytes(bytes))
+    }
 }
 
 fn paint_search(a: &App, hdc: HDC, rc: RECT) {
@@ -1551,9 +1665,20 @@ fn draw_item(a: &App, dis: &DRAWITEMSTRUCT) {
                 a.brushes[B_BG]
             },
         );
-        let Some(t) = a.results.get(dis.itemID as usize) else {
+        // A result row (with its heart) or a library row (all saved, so no
+        // heart; flagged when its file has gone).
+        let id = dis.itemID as usize;
+        let row = match a.source {
+            Source::Results => a.results.get(id).map(|t| (t.clone(), false, true)),
+            Source::Library => a.view_idx.get(id).and_then(|&i| a.lib.get(i)).map(|e| {
+                let gone = !library::audio_dir(&a.lib_root).join(&e.file).is_file();
+                (e.track(), gone, false)
+            }),
+        };
+        let Some((t, missing, hearts)) = row else {
             return;
         };
+        let t = &t;
         let playing = a.current().is_some_and(|c| c.is_same(t));
         if playing {
             let bar = RECT {
@@ -1590,7 +1715,21 @@ fn draw_item(a: &App, dis: &DRAWITEMSTRUCT) {
             right: rc.right - a.s(10),
             bottom: rc.bottom - a.s(3),
         };
-        let meta_rc = paint_row_heart(a, hdc, t, meta_rc);
+        let mut meta_rc = if hearts {
+            paint_row_heart(a, hdc, t, meta_rc)
+        } else {
+            meta_rc
+        };
+        if missing {
+            const GONE: &str = "File missing";
+            let w = text_width(hdc, GONE, a.fonts.meta) + a.s(4);
+            let gone = RECT {
+                left: meta_rc.right - w,
+                ..meta_rc
+            };
+            text(hdc, GONE, gone, a.fonts.meta, ERR, LINE | DT_RIGHT);
+            meta_rc.right = gone.left - a.s(8);
+        }
         text(hdc, &t.meta(), meta_rc, a.fonts.meta, DIM, LINE);
     }
 }
@@ -1826,9 +1965,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         let list = with(|a| a.list).unwrap();
                         let i = SendMessageW(list, LB_GETCURSEL, None, None).0;
                         if i >= 0 {
-                            play_result(i as usize);
+                            play_shown(i as usize, false);
                         }
                     }
+                    (ID_EDIT, 0x300) => on_edit_change(), // EN_CHANGE
                     (ID_EDIT, 0x100) | (ID_EDIT, 0x200) => {
                         // EN_SETFOCUS / EN_KILLFOCUS: repaint the field outline.
                         repaint();

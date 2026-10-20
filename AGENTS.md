@@ -9,8 +9,8 @@ same shape as tasca (plain Win32 via `windows` 0.62, launcher in `launch.rs`).
 | File | Role |
 | --- | --- |
 | `launch.rs` | `toggle / quit / --hidden`: post to the running resident or become it; elevated starts relaunch through explorer.exe |
-| `ui.rs` | The resident: one popup with two views (Search: EDIT + owner-drawn LBS_NODATA listbox; Player: fully painted, double-buffered), queue, tray icon, message loop |
-| `library.rs` | The saved library: `library.json` index (atomic writes, `.bad` on corruption), `library\` audio folder, startup sweep, yt-dlp `--print` line to entry |
+| `ui.rs` | The resident: one popup with two views (Search: EDIT + owner-drawn LBS_NODATA listbox showing the library or YouTube results; Player: fully painted, double-buffered), queue, tray icon, message loop |
+| `library.rs` | The saved library: `library.json` index (atomic writes, `.bad` on corruption), `library\` audio folder, startup sweep, yt-dlp `--print` line to entry, the live `filter`, `shuffle_first` |
 | `download.rs` | Save worker: one thread, FIFO of URLs, one yt-dlp at a time into `library\.partial\` (joins the job) |
 | `job.rs` | The one process-wide kill-on-close job object; `job::join(child)` for every child that must not outlive musica (mpv, the download yt-dlp; search's short-lived yt-dlp does not) |
 | `search.rs` | `yt-dlp --flat-playlist --dump-single-json ytsearchN:` and parsing |
@@ -27,6 +27,9 @@ same shape as tasca (plain Win32 via `windows` 0.62, launcher in `launch.rs`).
 - Saving runs `yt-dlp -q --no-warnings --no-playlist --playlist-items 1 -f bestaudio/best --no-simulate -o <library>\.partial\%(id)s.%(ext)s --print after_move:%(.{id,title,channel,uploader,duration,ext,filepath,webpage_url})j -- <url>`. No `-x`, no ffmpeg, no `player_client=android`. The worker only downloads; the UI thread moves the file, adds the entry and writes the index. A pasted YouTube link gets its id from the URL (`search::youtube_id`) so a saved track shows as saved at once; any other link gets yt-dlp's id from the print line. A duplicate id is dropped after download.
 - Saved tracks play from `library\<file>` (`library::local_file`), else the URL. While a local file plays, `Event::Title` is ignored (mpv reports the file name) and the length comes from the index. "Is this the playing row" is `Track::is_same` (id, else url).
 - Library RAM measured (debug, `PrivateMemorySize64`): musica idle 1.97 MB on main, 1.98 MB with an empty library, 1.94 MB with 50 entries; the download's yt-dlp peaks near 52 MB (3 min track and 2 h mix alike) and is gone when it ends.
+- The Search list has two sources (`Source::Library`, `Source::Results`). Library: `App::view_idx` (index positions, newest first, `library::filter` by the box text), rebuilt by `sync_list` on every `EN_CHANGE` and when the library changes. Results stay across edits; only Enter or an emptied box changes the source. A failed search falls back to Library with the failure status. Enter, double-click and Shift+Enter (`library::shuffle_first`, no `rand`) clone the shown list into `queue` (`play_shown`). The queue is a `Vec<Track>` clone, not index positions: removing a track (MUSICA-9) shifts the index under a queue that held positions.
+- Queue RAM measured (debug): musica playing a 50-track library queue 2.50–2.55 MB vs 2.55–2.56 MB for a one-track queue, mpv 42–43 MB either way. The clone is below what `PrivateMemorySize64` can resolve. Idle with 50 entries: 2.02 MB hidden / 2.48 MB with the popup shown, against 1.91–1.98 / 2.42 empty.
+- Shift+Enter reads `GetAsyncKeyState`, so posted messages cannot set it. Test shuffle with a throwaway build that also accepts a flag in `lParam`; don't commit it.
 - You cannot confirm the Caps+M hotkey fires or that audio is audible. Say so and ask the owner. You can confirm mpv's `time-pos` advances by connecting a second client to `\\.\pipe\musica-mpv-<pid>`.
 
 ## Testing next to the installed copy
