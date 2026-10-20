@@ -26,7 +26,6 @@ pub enum Event {
     Title(String),
     Paused(bool),
     Idle(bool),
-    Volume(f64),
     /// Seconds; `None` while unknown (and for most live streams).
     Duration(Option<f64>),
     /// Answer to `query_pos`.
@@ -46,16 +45,20 @@ pub struct Player {
     tx: Option<Sender<String>>,
     job: HANDLE,
     notify: std::sync::Arc<Notify>,
+    /// App level 0..=100, not mpv's linear volume. Kept here so it can be
+    /// re-applied whenever mpv (re)starts.
+    level: i32,
 }
 
 impl Player {
-    pub fn new(notify: Notify) -> Self {
+    pub fn new(notify: Notify, level: i32) -> Self {
         let job = unsafe { make_job() }.unwrap_or_default();
         Self {
             child: None,
             tx: None,
             job,
             notify: std::sync::Arc::new(notify),
+            level: level.clamp(0, 100),
         }
     }
 
@@ -78,8 +81,12 @@ impl Player {
         self.send(json!({ "command": ["seek", 0, "absolute"] }));
     }
 
-    pub fn add_volume(&mut self, delta: i32) {
-        self.send(json!({ "command": ["add", "volume", delta] }));
+    /// Set the app level (0..=100) and send the resulting absolute mpv volume.
+    /// Absolute, not `add`: the app level is the source of truth, and mpv's
+    /// own linear steps are inaudible near the top.
+    pub fn set_level(&mut self, level: i32) {
+        self.level = level.clamp(0, 100);
+        self.send(volume_command(self.level));
     }
 
     /// Ask for `time-pos`; the answer arrives as `Event::Pos`. Polled by the UI
@@ -166,11 +173,12 @@ impl Player {
             (1, "media-title"),
             (2, "pause"),
             (3, "idle-active"),
-            (4, "volume"),
-            (5, "duration"),
+            (4, "duration"),
         ] {
             let _ = tx.send(json!({ "command": ["observe_property", id, prop] }).to_string());
         }
+        // Re-apply the level on every (re)start: a new mpv starts at 100%.
+        let _ = tx.send(volume_command(self.level).to_string());
         let notify = self.notify.clone();
         std::thread::spawn(move || io_loop(conn, rx, &**notify));
         self.tx = Some(tx);
@@ -215,6 +223,27 @@ unsafe fn make_job() -> Option<HANDLE> {
         .ok()?;
         Some(job)
     }
+}
+
+/// App level 0..=100 to mpv's linear volume: `100·(level/100)³`.
+///
+/// Cubic, so equal steps feel equal: the quiet end gets usable range and the
+/// top stays fine-grained (mpv's own linear ±5 was inaudible up there). mpv
+/// keeps `--volume-max=100`, so level 100 is 0 dBFS and never above it.
+pub fn volume_for_level(level: i32) -> f64 {
+    let x = level.clamp(0, 100) as f64 / 100.0;
+    100.0 * x * x * x
+}
+
+/// Gain relative to full scale, for the toast: 60·log10(level/100).
+/// `None` at level 0 (silence).
+pub fn db_for_level(level: i32) -> Option<f64> {
+    let volume = volume_for_level(level);
+    (volume > 0.0).then(|| 20.0 * (volume / 100.0).log10())
+}
+
+fn volume_command(level: i32) -> Value {
+    json!({ "command": ["set_property", "volume", volume_for_level(level)] })
 }
 
 fn connect(pipe: &str, timeout: Duration) -> Option<File> {
@@ -302,7 +331,6 @@ fn parse_event(line: &[u8]) -> Option<Event> {
             "media-title" => Some(Event::Title(v["data"].as_str().unwrap_or("").to_string())),
             "pause" => Some(Event::Paused(v["data"].as_bool().unwrap_or(false))),
             "idle-active" => Some(Event::Idle(v["data"].as_bool().unwrap_or(false))),
-            "volume" => v["data"].as_f64().map(Event::Volume),
             "duration" => Some(Event::Duration(v["data"].as_f64())),
             _ => None,
         },
@@ -322,6 +350,40 @@ fn parse_event(line: &[u8]) -> Option<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cubic_curve() {
+        assert_eq!(volume_for_level(0), 0.0);
+        assert!((volume_for_level(50) - 12.5).abs() < 1e-9);
+        assert!((volume_for_level(85) - 61.4125).abs() < 1e-9);
+        assert_eq!(volume_for_level(100), 100.0);
+        for level in 0..100 {
+            assert!(volume_for_level(level) < volume_for_level(level + 1));
+        }
+    }
+
+    #[test]
+    fn level_clamps_to_0_100() {
+        assert_eq!(volume_for_level(-1), 0.0);
+        assert_eq!(volume_for_level(-100), 0.0);
+        assert_eq!(volume_for_level(101), 100.0);
+        assert_eq!(volume_for_level(9999), 100.0);
+    }
+
+    #[test]
+    fn db_is_fine_at_the_top_and_coarse_at_the_bottom() {
+        assert!(db_for_level(0).is_none());
+        assert!(db_for_level(100).unwrap().abs() < 1e-9);
+        // 60·log10(0.5) = -18.06 dB at half level.
+        assert!((db_for_level(50).unwrap() + 18.0618).abs() < 1e-4);
+        // Fine where it used to be inaudible, coarse where the range is needed.
+        let top = db_for_level(100).unwrap() - db_for_level(98).unwrap();
+        let bottom = db_for_level(20).unwrap() - db_for_level(18).unwrap();
+        assert!(top < 0.6, "top step {top}");
+        assert!(bottom > 2.0, "bottom step {bottom}");
+        // Twenty ±2 presses from full is a clearly audible -13.3 dB.
+        assert!((db_for_level(60).unwrap() + 13.311).abs() < 1e-3);
+    }
 
     #[test]
     fn events() {
@@ -348,10 +410,6 @@ mod tests {
         assert!(matches!(
             ev(r#"{"event":"property-change","id":5,"name":"duration"}"#),
             Some(Event::Duration(None))
-        ));
-        assert!(matches!(
-            ev(r#"{"event":"property-change","id":4,"name":"volume","data":85.0}"#),
-            Some(Event::Volume(v)) if v == 85.0
         ));
         assert!(ev(r#"{"request_id":0,"error":"success"}"#).is_none());
     }
