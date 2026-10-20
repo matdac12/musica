@@ -14,8 +14,8 @@ pub struct Track {
     /// Seconds; `None` for live streams.
     pub duration: Option<u64>,
     pub url: String,
-    /// The YouTube video id from the search; `None` for a pasted link.
-    #[allow(dead_code)] // read by the library save (MUSICA-6)
+    /// The YouTube video id: from the search, or read out of a pasted YouTube
+    /// link. `None` for any other link; a save then takes yt-dlp's id.
     pub id: Option<String>,
     /// False for a pasted link, whose length comes from mpv instead.
     pub from_search: bool,
@@ -30,14 +30,16 @@ pub fn fmt_secs(s: u64) -> String {
 }
 
 impl Track {
-    /// A pasted link: no search metadata, and no id.
+    /// A pasted link: no search metadata. Its id is only what the URL itself
+    /// says (see `youtube_id`), enough to know a saved track before any
+    /// download. yt-dlp's own id still decides when a download finishes.
     pub fn from_link(url: String) -> Self {
         Self {
             title: url.clone(),
             channel: String::new(),
             duration: None,
+            id: youtube_id(&url),
             url,
-            id: None,
             from_search: false,
         }
     }
@@ -50,6 +52,35 @@ impl Track {
             format!("{}  ·  {length}", self.channel)
         }
     }
+}
+
+/// The video id in a YouTube link (`watch?v=`, `youtu.be/`, `/shorts/`,
+/// `/live/`), or `None`.
+pub fn youtube_id(url: &str) -> Option<String> {
+    let rest = url.trim().split_once("://")?.1;
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.to_ascii_lowercase();
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
+    let query = query.split('#').next().unwrap_or("");
+    let path = path.split('#').next().unwrap_or("");
+    let candidate = if host == "youtu.be" {
+        path.split('/').next()
+    } else if host == "youtube.com" || host.ends_with(".youtube.com") {
+        if path == "watch" {
+            query.split('&').find_map(|kv| kv.strip_prefix("v="))
+        } else {
+            path.strip_prefix("shorts/")
+                .or_else(|| path.strip_prefix("live/"))
+                .and_then(|p| p.split('/').next())
+        }
+    } else {
+        None
+    }?;
+    let ok = candidate.len() == 11
+        && candidate
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    ok.then(|| candidate.to_string())
 }
 
 pub fn is_url(q: &str) -> bool {
@@ -136,10 +167,38 @@ mod tests {
     }
 
     #[test]
-    fn pasted_link_has_no_id() {
-        let t = Track::from_link("https://youtu.be/x".into());
-        assert!(t.id.is_none() && !t.from_search);
+    fn pasted_link_takes_its_id_from_the_url() {
+        let t = Track::from_link("https://youtu.be/dQw4w9WgXcQ?si=abc".into());
+        assert_eq!(t.id.as_deref(), Some("dQw4w9WgXcQ"));
+        assert!(!t.from_search);
         assert_eq!(t.title, t.url);
+        let other = Track::from_link("https://example.com/a".into());
+        assert!(other.id.is_none());
+    }
+
+    #[test]
+    fn youtube_ids() {
+        let id = Some("dQw4w9WgXcQ".to_string());
+        for u in [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?list=PL1&v=dQw4w9WgXcQ&t=5s",
+            "https://m.youtube.com/watch?v=dQw4w9WgXcQ#x",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "http://music.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+            "https://www.youtube.com/live/dQw4w9WgXcQ?feature=share",
+        ] {
+            assert_eq!(youtube_id(u), id, "{u}");
+        }
+        for u in [
+            "https://www.youtube.com/playlist?list=PLabc",
+            "https://www.youtube.com/watch?v=short",
+            "https://notyoutube.com/watch?v=dQw4w9WgXcQ",
+            "https://example.com/dQw4w9WgXcQ",
+            "lofi",
+        ] {
+            assert_eq!(youtube_id(u), None, "{u}");
+        }
     }
 
     #[test]
