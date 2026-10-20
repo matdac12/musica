@@ -14,6 +14,9 @@ pub struct Track {
     /// Seconds; `None` for live streams.
     pub duration: Option<u64>,
     pub url: String,
+    /// The YouTube video id from the search; `None` for a pasted link.
+    #[allow(dead_code)] // read by the library save (MUSICA-6)
+    pub id: Option<String>,
     /// False for a pasted link, whose length comes from mpv instead.
     pub from_search: bool,
 }
@@ -27,6 +30,18 @@ pub fn fmt_secs(s: u64) -> String {
 }
 
 impl Track {
+    /// A pasted link: no search metadata, and no id.
+    pub fn from_link(url: String) -> Self {
+        Self {
+            title: url.clone(),
+            channel: String::new(),
+            duration: None,
+            url,
+            id: None,
+            from_search: false,
+        }
+    }
+
     pub fn meta(&self) -> String {
         let length = self.duration.map(fmt_secs).unwrap_or_else(|| "live".into());
         if self.channel.is_empty() {
@@ -92,6 +107,7 @@ pub fn parse(json: &[u8]) -> Result<Vec<Track>, String> {
                     .to_string(),
                 duration: e["duration"].as_f64().map(|d| d as u64),
                 url,
+                id: Some(id.to_string()),
                 from_search: true,
             })
         })
@@ -113,8 +129,17 @@ mod tests {
         let t = parse(json).unwrap();
         assert_eq!(t.len(), 2);
         assert_eq!(t[0].meta(), "Girl  ·  1:04:42");
+        assert_eq!(t[0].id.as_deref(), Some("a1"));
+        assert_eq!(t[1].id.as_deref(), Some("b2"));
         assert_eq!(t[1].url, "https://www.youtube.com/watch?v=b2");
         assert_eq!(t[1].meta(), "Up  ·  live");
+    }
+
+    #[test]
+    fn pasted_link_has_no_id() {
+        let t = Track::from_link("https://youtu.be/x".into());
+        assert!(t.id.is_none() && !t.from_search);
+        assert_eq!(t.title, t.url);
     }
 
     #[test]

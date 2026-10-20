@@ -1,6 +1,6 @@
 //! Playback: one long-lived, windowless `mpv --idle` child driven over its JSON
 //! IPC named pipe. mpv resolves YouTube URLs itself through yt-dlp. The child
-//! sits in a kill-on-close job object, so it never outlives musica.
+//! joins the process-wide kill-on-close job (`job.rs`), so it never outlives musica.
 
 use serde_json::{json, Value};
 use std::fs::File;
@@ -10,14 +10,10 @@ use std::process::{Child, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Pipes::PeekNamedPipe;
 
+use crate::job;
 use crate::log::log;
 use crate::tools;
 
@@ -43,7 +39,6 @@ pub type Notify = Box<dyn Fn(Event) + Send + Sync + 'static>;
 pub struct Player {
     child: Option<Child>,
     tx: Option<Sender<String>>,
-    job: HANDLE,
     notify: std::sync::Arc<Notify>,
     /// App level 0..=100, not mpv's linear volume. Kept here so it can be
     /// re-applied whenever mpv (re)starts.
@@ -52,11 +47,9 @@ pub struct Player {
 
 impl Player {
     pub fn new(notify: Notify, level: i32) -> Self {
-        let job = unsafe { make_job() }.unwrap_or_default();
         Self {
             child: None,
             tx: None,
-            job,
             notify: std::sync::Arc::new(notify),
             level: level.clamp(0, 100),
         }
@@ -157,9 +150,7 @@ impl Player {
         let child = cmd
             .spawn()
             .map_err(|e| format!("mpv failed to start: {e}"))?;
-        if !self.job.is_invalid() {
-            let _ = unsafe { AssignProcessToJobObject(self.job, HANDLE(child.as_raw_handle())) };
-        }
+        job::join(&child);
         log(format!(
             "mpv started: pid {} ({})",
             child.id(),
@@ -203,25 +194,6 @@ impl Player {
 impl Drop for Player {
     fn drop(&mut self) {
         self.shutdown();
-        if !self.job.is_invalid() {
-            let _ = unsafe { CloseHandle(self.job) };
-        }
-    }
-}
-
-unsafe fn make_job() -> Option<HANDLE> {
-    unsafe {
-        let job = CreateJobObjectW(None, None).ok()?;
-        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const _,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-        .ok()?;
-        Some(job)
     }
 }
 

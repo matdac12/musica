@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod job;
 mod launch;
 mod log;
 mod player;

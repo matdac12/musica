@@ -750,14 +750,7 @@ fn submit() {
         return;
     }
     if search::is_url(&q) {
-        let track = Track {
-            title: q.clone(),
-            channel: String::new(),
-            duration: None,
-            url: q,
-            from_search: false,
-        };
-        play_queue(vec![track], 0);
+        play_queue(vec![Track::from_link(q)], 0);
         return;
     }
     let Some((hwnd, seq)) = with(|a| {
