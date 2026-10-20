@@ -143,10 +143,27 @@ pub fn clear_dir(dir: &Path) {
 /// Saved if the index has the track's id; a pasted link has no id until it is
 /// saved, so its URL is matched instead.
 pub fn is_saved(entries: &[Entry], track: &Track) -> bool {
+    find(entries, track).is_some()
+}
+
+/// The entry for a track: by id, or by URL for a pasted link without one.
+pub fn find<'a>(entries: &'a [Entry], track: &Track) -> Option<&'a Entry> {
     match &track.id {
-        Some(id) => entries.iter().any(|e| &e.id == id),
-        None => entries.iter().any(|e| e.url == track.url),
+        Some(id) => entries.iter().find(|e| &e.id == id),
+        None => entries.iter().find(|e| e.url == track.url),
     }
+}
+
+/// The saved file to play instead of the URL, with its entry. `None` when the
+/// track is not saved or its file has gone (the caller then streams the URL).
+pub fn local_file<'a>(
+    root: &Path,
+    entries: &'a [Entry],
+    track: &Track,
+) -> Option<(&'a Entry, PathBuf)> {
+    let entry = find(entries, track)?;
+    let path = audio_dir(root).join(&entry.file);
+    path.is_file().then_some((entry, path))
 }
 
 /// Only a track with a known, finite length can be saved. A search result
@@ -454,6 +471,23 @@ mod tests {
         assert!(!is_saved(&entries, &track(Some("nope"), Some(1), true)));
         // A pasted link has no id: its URL decides.
         assert!(is_saved(&entries, &track(None, None, false)));
+    }
+
+    #[test]
+    fn local_file_only_while_the_file_exists() {
+        let root = scratch("local");
+        let entries = vec![entry("abc")];
+        let t = track(Some("abc"), Some(181), true);
+        // Indexed but the file is gone: stream the URL.
+        assert!(local_file(&root, &entries, &t).is_none());
+        std::fs::create_dir_all(audio_dir(&root)).unwrap();
+        std::fs::write(audio_dir(&root).join("abc.webm"), "x").unwrap();
+        let (e, path) = local_file(&root, &entries, &t).unwrap();
+        assert_eq!(e.title, "title abc");
+        assert_eq!(path, audio_dir(&root).join("abc.webm"));
+        // Not in the index at all.
+        assert!(local_file(&root, &entries, &track(Some("other"), Some(1), true)).is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

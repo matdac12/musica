@@ -12,8 +12,8 @@ a windowless `mpv` child that resolves YouTube through `yt-dlp`; it uses about
 
 Prototype. Search, play, a player view with the queue, pause, next/previous,
 volume. Live streams (lofi radios) work. Save the playing track to a local
-library (below). Browsing the library, playing from disk and search history
-come later.
+library (below); saved tracks play from disk, offline. Browsing the library
+and search history come later.
 
 ## Usage
 
@@ -55,6 +55,11 @@ the playing track: Musica downloads it with `yt-dlp` as the native best audio
 and lists it in `library.json` next to it. The heart is an outline when not
 saved, dim while queued or downloading, orange once saved.
 
+- A saved track plays from its file wherever you start it (search result,
+  queue, pasted link), so it works with no network. It shows its saved title and
+  length at once. If the file was deleted by hand, it streams from YouTube
+  instead. Saved tracks show an orange heart in the results and in Up next; a
+  track being downloaded shows a dim one.
 - Only finite tracks can be saved. A live stream, or a pasted link before its
   length is known, says "Live streams can't be saved". A saved track says
   "Already saved". Save never toggles, and there is no unsave yet.
