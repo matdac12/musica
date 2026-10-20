@@ -142,6 +142,9 @@ struct App {
     /// name then, so it is ignored, and the length is the index's.
     local: bool,
     local_duration: Option<f64>,
+    /// File name of the last saved file played: a late `media-title` for it can
+    /// still arrive after the next (streamed) track has started.
+    local_name: String,
     /// App volume level 0..=100 (not mpv's volume); see `player::volume_for_level`.
     level: i32,
     /// What is on disk, so border presses don't rewrite the file.
@@ -174,11 +177,12 @@ impl App {
         }
     }
 
-    /// Track length: the search result's when it has one (no duration there
-    /// means a live stream), else what mpv reports (pasted links).
+    /// Track length: the index's for a saved file; else the search result's
+    /// when it has one (no duration there means a live stream); else what mpv
+    /// reports (pasted links).
     fn duration(&self) -> Option<f64> {
         let t = self.current()?;
-        if let Some(d) = self.local_duration.filter(|_| self.local) {
+        if let Some(d) = self.local_duration {
             Some(d)
         } else if t.from_search {
             t.duration.map(|d| d as f64)
@@ -350,6 +354,7 @@ unsafe fn run_inner(show: bool) -> Result<i32> {
             mpv_duration: None,
             local: false,
             local_duration: None,
+            local_name: String::new(),
             level: settings.level,
             saved_level: settings.level,
             volume_flash: None,
@@ -909,6 +914,9 @@ fn play_current() {
             Some((title, secs, path)) => {
                 log(format!("from disk: {}", path.display()));
                 a.now_title = title;
+                a.local_name = path
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
                 a.local_duration = (secs > 0).then_some(secs as f64);
                 path.to_string_lossy().into_owned()
             }
@@ -1063,7 +1071,7 @@ fn on_player(ev: Event) {
     let mut advance = false;
     with(|a| match ev {
         Event::Title(t) => {
-            if !a.local && !t.is_empty() && !t.starts_with("watch?") {
+            if !a.local && t != a.local_name && !t.is_empty() && !t.starts_with("watch?") {
                 a.now_title = t;
             }
         }
