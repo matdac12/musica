@@ -5,21 +5,28 @@
 
 use std::os::windows::io::AsRawHandle;
 use std::process::Child;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 
-/// The job handle, created on first use and never closed: it must live exactly
-/// as long as the process. `None` if the job could not be made.
+/// The job handle, created on first success and never closed: it must live
+/// exactly as long as the process. A failed creation is not remembered, so the
+/// next `join` tries again.
 fn handle() -> Option<HANDLE> {
-    static JOB: OnceLock<Option<isize>> = OnceLock::new();
-    JOB.get_or_init(|| unsafe { make().map(|h| h.0 as isize) })
-        .map(|h| HANDLE(h as *mut _))
+    static JOB: Mutex<Option<isize>> = Mutex::new(None);
+    let mut slot = JOB.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+        match unsafe { make() } {
+            Ok(h) => *slot = Some(h.0 as isize),
+            Err(e) => crate::log::log(format!("job object not created: {e}")),
+        }
+    }
+    slot.map(|h| HANDLE(h as *mut _))
 }
 
 /// Put a freshly spawned child in the job. Best effort: a failure is only
@@ -34,19 +41,21 @@ pub fn join(child: &Child) {
     }
 }
 
-unsafe fn make() -> Option<HANDLE> {
+unsafe fn make() -> windows::core::Result<HANDLE> {
     unsafe {
-        let job = CreateJobObjectW(None, None).ok()?;
+        let job = CreateJobObjectW(None, None)?;
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(
+        if let Err(e) = SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
             &info as *const _ as *const _,
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-        .ok()?;
-        Some(job)
+        ) {
+            let _ = CloseHandle(job);
+            return Err(e);
+        }
+        Ok(job)
     }
 }
 

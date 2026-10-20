@@ -180,8 +180,8 @@ struct App {
     // Library: the index lives here, loaded at startup.
     lib_root: std::path::PathBuf,
     lib: Vec<Entry>,
-    /// URLs queued or downloading, for the dim heart.
-    saving: Vec<String>,
+    /// Downloads queued or running, for the dim heart.
+    saving: Vec<Saving>,
     downloader: Option<Downloader>,
     toast: Option<Toast>,
     undo: Option<Undo>,
@@ -196,6 +196,23 @@ const B_SEL: usize = 2;
 const B_ACCENT: usize = 3;
 const B_TRACK: usize = 4;
 const B_RULE: usize = 5;
+
+/// A queued or running download: the URL the worker was given, and the video
+/// id when one was known, so a pasted link and a search result for the same
+/// video count as one download.
+struct Saving {
+    url: String,
+    id: Option<String>,
+}
+
+/// Is `t` already queued or downloading? By id when both sides have one, else
+/// by URL (the same rule as `Track::is_same`).
+fn is_saving(saving: &[Saving], t: &Track) -> bool {
+    saving.iter().any(|s| match (&s.id, &t.id) {
+        (Some(a), Some(b)) => a == b,
+        _ => s.url == t.url,
+    })
+}
 
 impl App {
     fn current(&self) -> Option<&Track> {
@@ -1031,6 +1048,12 @@ fn play_queue(queue: Vec<Track>, qi: usize) {
 }
 
 fn play_current() {
+    start_current(false);
+}
+
+/// `force_url` streams even if a saved file exists (the fallback after mpv
+/// failed to open it).
+fn start_current(force_url: bool) {
     let r = with(|a| {
         let t = a.queue.get(a.qi)?.clone();
         log(format!("play {} ({}/{})", t.url, a.qi + 1, a.queue.len()));
@@ -1044,6 +1067,7 @@ fn play_current() {
         // A saved track plays from its file (no network); if the file has
         // gone, the URL.
         let local = library::local_file(&a.lib_root, &a.lib, &t)
+            .filter(|_| !force_url)
             .map(|(e, path)| (e.title.clone(), e.duration, path));
         a.local = local.is_some();
         a.local_duration = None;
@@ -1193,13 +1217,16 @@ fn save_current() {
         };
         if library::is_saved(&a.lib, &t) {
             a.show_toast("Already saved", false);
-        } else if a.saving.contains(&t.url) {
+        } else if is_saving(&a.saving, &t) {
             // Already queued or downloading: ignored.
         } else if !library::savable(&t, a.mpv_duration) {
             a.show_toast("Live streams can't be saved", true);
         } else {
             let (hwnd_raw, root) = (a.hwnd.0 as isize, a.lib_root.clone());
-            a.saving.push(t.url.clone());
+            a.saving.push(Saving {
+                url: t.url.clone(),
+                id: t.id.clone(),
+            });
             a.downloader
                 .get_or_insert_with(|| {
                     Downloader::new(
@@ -1233,7 +1260,7 @@ fn save_current() {
 /// deduplicated by it: the new file is dropped if that id is already saved.
 fn on_library(url: String, r: std::result::Result<Printed, String>) {
     with(|a| {
-        a.saving.retain(|u| *u != url);
+        a.saving.retain(|s| s.url != url);
         let p = match r {
             Ok(p) => p,
             Err(e) => return a.show_toast(format!("Couldn't save: {e}"), true),
@@ -1264,8 +1291,8 @@ fn on_library(url: String, r: std::result::Result<Printed, String>) {
             p.id,
             a.lib.last().map_or(0, |e| e.bytes)
         ));
-        for t in a.queue.iter_mut().filter(|t| t.url == url) {
-            t.id.get_or_insert_with(|| p.id.clone());
+        for t in a.queue.iter_mut().filter(|t| t.id.is_none() && t.url == url) {
+            t.id = Some(p.id.clone());
         }
         a.show_toast("Saved", false);
     });
@@ -1321,6 +1348,7 @@ fn prev() {
 
 fn on_player(ev: Event) {
     let mut advance = false;
+    let mut fallback = false;
     with(|a| match ev {
         Event::Title(t) => {
             if !a.local && t != a.local_name && !t.is_empty() && !t.starts_with("watch?") {
@@ -1337,11 +1365,28 @@ fn on_player(ev: Event) {
         }
         Event::Duration(d) => a.mpv_duration = d,
         Event::Pos(p) => a.pos = p,
-        Event::Eof => advance = a.qi + 1 < a.queue.len(),
+        Event::Eof => {
+            advance = a.qi + 1 < a.queue.len();
+            if !advance {
+                a.local = false;
+                a.local_duration = None;
+            }
+        }
         Event::Error(e) => {
-            a.loading = false;
-            a.playing = false;
-            a.error = Some(format!("Couldn't play: {e}"));
+            // A saved file that vanished (or won't open) after the check:
+            // stream the URL once. `local` is cleared first, so a second
+            // error is a real one.
+            let retry = a.local && a.playing;
+            a.local = false;
+            a.local_duration = None;
+            if retry {
+                log(format!("saved file failed ({e}): falling back to the URL"));
+                fallback = true;
+            } else {
+                a.loading = false;
+                a.playing = false;
+                a.error = Some(format!("Couldn't play: {e}"));
+            }
         }
         Event::Exited => {
             a.loading = false;
@@ -1350,6 +1395,10 @@ fn on_player(ev: Event) {
     });
     if advance {
         next();
+        return;
+    }
+    if fallback {
+        start_current(true);
         return;
     }
     repaint_list();
@@ -1545,7 +1594,7 @@ fn player_hits(a: &App) -> PlayerHits {
 fn row_heart(a: &App, t: &Track) -> Option<COLORREF> {
     if library::is_saved(&a.lib, t) {
         Some(ACCENT)
-    } else if a.saving.contains(&t.url) {
+    } else if is_saving(&a.saving, t) {
         Some(DIM)
     } else {
         None
@@ -1618,7 +1667,7 @@ fn paint_player(a: &App, hdc: HDC, rc: RECT) {
         text(hdc, &a.now_title, title_rc, a.fonts.big, TEXT, LINE);
         let (glyph, color) = if library::is_saved(&a.lib, t) {
             (G_HEART_FILL, ACCENT)
-        } else if a.saving.contains(&t.url) {
+        } else if is_saving(&a.saving, t) {
             (G_HEART_FILL, DIM)
         } else {
             (G_HEART, DIM)
@@ -2207,5 +2256,43 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(url: &str, id: Option<&str>) -> Track {
+        Track {
+            title: String::new(),
+            channel: String::new(),
+            duration: Some(60),
+            url: url.into(),
+            id: id.map(Into::into),
+            from_search: id.is_some(),
+        }
+    }
+
+    #[test]
+    fn saving_matches_by_id_then_url() {
+        let saving = vec![
+            Saving {
+                url: "https://youtu.be/abcdefghijk".into(),
+                id: Some("abcdefghijk".into()),
+            },
+            Saving {
+                url: "https://example.com/a".into(),
+                id: None,
+            },
+        ];
+        // The search result for the same video, with another URL form.
+        let result = track("https://www.youtube.com/watch?v=abcdefghijk", Some("abcdefghijk"));
+        assert!(is_saving(&saving, &result));
+        let other = track("https://youtu.be/zzzzzzzzzzz", Some("zzzzzzzzzzz"));
+        assert!(!is_saving(&saving, &other));
+        // No id: the URL decides.
+        assert!(is_saving(&saving, &track("https://example.com/a", None)));
+        assert!(!is_saving(&saving, &track("https://example.com/b", None)));
     }
 }
