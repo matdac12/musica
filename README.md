@@ -12,8 +12,9 @@ a windowless `mpv` child that resolves YouTube through `yt-dlp`; it uses about
 
 Prototype. Search, play, a player view with the queue, pause, next/previous,
 volume. Live streams (lofi radios) work. Save the playing track to a local
-library (below); saved tracks play from disk, offline. Browsing the library
-and search history come later.
+library (below); saved tracks play from disk, offline. The Search view lists
+the library, so you can browse and filter it. Removing tracks and search
+history come later.
 
 ## Usage
 
@@ -41,10 +42,13 @@ plays.
 
 | Key | Search |
 | --- | --- |
-| Enter | Search (or play, if you pasted a YouTube link) |
-| ↓ / ↑ | Into the results / back to the search box |
-| Enter, double-click | Play the selected result and open the player |
-| Space | Pause / resume (in the results) |
+| Typing | Filters the saved library live, by title or channel (no network) |
+| Enter (in the box) | Search YouTube (or play, if you pasted a YouTube link) |
+| ↓ / ↑ | Into the list / back to the search box |
+| Enter, double-click (in the list) | Play the list as shown, from the selected row, and open the player |
+| Shift+Enter (library list) | Play the library list shuffled, the selected track first |
+| Ctrl+↑ / Ctrl+↓ | Volume (Ctrl+Shift for ±10) |
+| Space | Pause / resume (in the list) |
 | Esc, Tab | Back to the player (Esc hides when nothing plays) |
 
 ## Saved tracks
@@ -67,6 +71,24 @@ saved, dim while queued or downloading, orange once saved.
   leaves nothing behind and shows "Couldn't save: ...".
 - The library survives reinstalls. A damaged `library.json` is kept as
   `library.json.bad` and Musica starts with an empty library; the audio files stay.
+
+### Browsing the library
+
+With the search box empty, the Search view lists everything saved, newest
+first; the status line says how many tracks and how much disk ("Library · 12
+tracks · 1.4 GB").
+
+- **Typing filters the library** as you type (title or channel, any case). The
+  library stays until you press Enter: only then do YouTube results replace it.
+  The results stay while you edit the box; emptying the box brings the library
+  back.
+- **Enter or double-click** on a library row plays the list as shown (all of it,
+  or the filtered part) from that row; at the end playback stops, there is no
+  loop. **Shift+Enter** plays it shuffled with the selected track first.
+- A row whose file has gone says "File missing" in red, and still plays from its
+  URL.
+- **Offline:** if the YouTube search fails, the list shows the saved tracks that
+  match the query, with "YouTube search failed · showing saved matches".
 
 The tray icon: left-click toggles the popup; right-click has Pause, Next, Stop and Quit.
 The log is `%LOCALAPPDATA%\Musica\musica.log`.
