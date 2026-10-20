@@ -10,8 +10,11 @@ same shape as tasca (plain Win32 via `windows` 0.62, launcher in `launch.rs`).
 | --- | --- |
 | `launch.rs` | `toggle / quit / --hidden`: post to the running resident or become it; elevated starts relaunch through explorer.exe |
 | `ui.rs` | The resident: one popup with two views (Search: EDIT + owner-drawn LBS_NODATA listbox; Player: fully painted, double-buffered), queue, tray icon, message loop |
+| `library.rs` | The saved library: `library.json` index (atomic writes, `.bad` on corruption), `library\` audio folder, startup sweep, yt-dlp `--print` line to entry |
+| `download.rs` | Save worker: one thread, FIFO of URLs, one yt-dlp at a time into `library\.partial\` (joins the job) |
+| `job.rs` | The one process-wide kill-on-close job object; `job::join(child)` for every child that must not outlive musica (mpv, the download yt-dlp; search's short-lived yt-dlp does not) |
 | `search.rs` | `yt-dlp --flat-playlist --dump-single-json ytsearchN:` and parsing |
-| `player.rs` | mpv child in a kill-on-close job object; one IO thread owns the pipe |
+| `player.rs` | mpv child (joins the shared job, it no longer owns one); one IO thread owns the pipe |
 | `tools.rs` | Find `mpv.exe` / `yt-dlp.exe` (PATH, then winget Links and Packages) |
 
 ## Rules
@@ -21,6 +24,8 @@ same shape as tasca (plain Win32 via `windows` 0.62, launcher in `launch.rs`).
 - The pipe handle is synchronous, so a blocking read would stall writes: the IO thread polls with `PeekNamedPipe`. Don't replace that with a blocking reader on the same handle.
 - UI state lives in a thread-local `RefCell`; `with()` returns `None` on re-entry. Release the borrow before calls that send messages to our own wndproc.
 - Background threads talk to the UI only by `PostMessageW` with a boxed payload; the wndproc frees it.
+- Saving runs `yt-dlp -q --no-warnings --no-playlist --playlist-items 1 -f bestaudio/best --no-simulate -o <library>\.partial\%(id)s.%(ext)s --print after_move:%(.{id,title,channel,uploader,duration,ext,filepath,webpage_url})j -- <url>`. No `-x`, no ffmpeg, no `player_client=android`. The worker only downloads; the UI thread moves the file, adds the entry and writes the index. A pasted YouTube link gets its id from the URL (`search::youtube_id`) so a saved track shows as saved at once; any other link gets yt-dlp's id from the print line. A duplicate id is dropped after download.
+- Library RAM measured (debug, `PrivateMemorySize64`): musica idle 1.97 MB on main, 1.98 MB with an empty library, 1.94 MB with 50 entries; the download's yt-dlp peaks near 52 MB (3 min track and 2 h mix alike) and is gone when it ends.
 - You cannot confirm the Caps+M hotkey fires or that audio is audible. Say so and ask the owner. You can confirm mpv's `time-pos` advances by connecting a second client to `\\.\pipe\musica-mpv-<pid>`.
 
 ## Testing next to the installed copy

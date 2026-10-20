@@ -20,8 +20,8 @@ use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_SELECT
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, GetAsyncKeyState, GetFocus, SetFocus, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-    VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_SHIFT,
-    VK_SPACE, VK_TAB, VK_UP,
+    VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_S,
+    VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -29,7 +29,9 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::download::Downloader;
 use crate::launch::{class, mutex, WM_QUIT_RESIDENT, WM_SHOW, WM_TOGGLE};
+use crate::library::{self, Entry, Printed};
 use crate::log::log;
 use crate::player::{self, Event, Player};
 use crate::search::{self, fmt_secs, Track};
@@ -38,6 +40,7 @@ use crate::settings::{self, Settings};
 const WM_TRAY: u32 = WM_APP + 10;
 const WM_RESULTS: u32 = WM_APP + 11;
 const WM_PLAYER: u32 = WM_APP + 12;
+const WM_LIBRARY: u32 = WM_APP + 13;
 const TIMER_POS: usize = 1;
 
 const ID_EDIT: usize = 100;
@@ -87,6 +90,8 @@ const G_PREV: &str = "\u{E892}";
 const G_NEXT: &str = "\u{E893}";
 const G_PLAY: &str = "\u{E768}";
 const G_PAUSE: &str = "\u{E769}";
+const G_HEART: &str = "\u{E006}";
+const G_HEART_FILL: &str = "\u{E00B}";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum View {
@@ -100,6 +105,13 @@ struct Fonts {
     title: HFONT,
     meta: HFONT,
     icons: HFONT,
+}
+
+/// A short message shown in the status line / player footer.
+struct Toast {
+    text: String,
+    error: bool,
+    until: Instant,
 }
 
 struct App {
@@ -132,6 +144,13 @@ struct App {
     saved_level: i32,
     volume_flash: Option<Instant>,
     player: Player,
+    // Library: the index lives here, loaded at startup.
+    lib_root: std::path::PathBuf,
+    lib: Vec<Entry>,
+    /// URLs queued or downloading, for the dim heart.
+    saving: Vec<String>,
+    downloader: Option<Downloader>,
+    toast: Option<Toast>,
 }
 
 // Indexes into `App::brushes`.
@@ -164,6 +183,14 @@ impl App {
 
     fn s(&self, v: i32) -> i32 {
         scale(v, self.dpi.max(96))
+    }
+
+    fn show_toast(&mut self, text: impl Into<String>, error: bool) {
+        self.toast = Some(Toast {
+            text: text.into(),
+            error,
+            until: Instant::now() + Duration::from_millis(4000),
+        });
     }
 }
 
@@ -273,6 +300,10 @@ unsafe fn run_inner(show: bool) -> Result<i32> {
 
         let hwnd_raw = hwnd.0 as isize;
         let settings = settings::load();
+        let lib_root = library::root();
+        let lib = library::load(&lib_root);
+        library::sweep(&lib_root, &lib);
+        log(format!("library: {} tracks", lib.len()));
         let player = Player::new(
             Box::new(move |ev: Event| {
                 let ptr = Box::into_raw(Box::new(ev));
@@ -315,6 +346,11 @@ unsafe fn run_inner(show: bool) -> Result<i32> {
             saved_level: settings.level,
             volume_flash: None,
             player,
+            lib_root,
+            lib,
+            saving: Vec::new(),
+            downloader: None,
+            toast: None,
         };
         APP.with(|a| *a.borrow_mut() = Some(app));
         tray(NIM_ADD);
@@ -647,6 +683,10 @@ fn pretranslate(msg: &MSG) -> bool {
             let key = msg.wParam.0 as u16;
             match key {
                 k if k == VK_SPACE.0 => with(|a| a.player.toggle_pause()).is_some(),
+                k if k == VK_S.0 && held(VK_CONTROL) => {
+                    save_current();
+                    true
+                }
                 k if k == VK_RIGHT.0 => {
                     next();
                     true
@@ -867,6 +907,92 @@ fn play_current() {
     tray(NIM_MODIFY);
 }
 
+/// Save the playing track: queue a download. Never a toggle.
+fn save_current() {
+    with(|a| {
+        let Some(t) = a.current().cloned() else {
+            return;
+        };
+        if library::is_saved(&a.lib, &t) {
+            a.show_toast("Already saved", false);
+        } else if a.saving.contains(&t.url) {
+            // Already queued or downloading: ignored.
+        } else if !library::savable(&t, a.mpv_duration) {
+            a.show_toast("Live streams can't be saved", true);
+        } else {
+            let (hwnd_raw, root) = (a.hwnd.0 as isize, a.lib_root.clone());
+            a.saving.push(t.url.clone());
+            a.downloader
+                .get_or_insert_with(|| {
+                    Downloader::new(
+                        root,
+                        Box::new(move |url, r| {
+                            let ptr = Box::into_raw(Box::new((url, r)));
+                            unsafe {
+                                if PostMessageW(
+                                    Some(HWND(hwnd_raw as _)),
+                                    WM_LIBRARY,
+                                    WPARAM(0),
+                                    LPARAM(ptr as isize),
+                                )
+                                .is_err()
+                                {
+                                    drop(Box::from_raw(ptr));
+                                }
+                            }
+                        }),
+                    )
+                })
+                .enqueue(t.url);
+        }
+    });
+    repaint();
+}
+
+/// A download finished or failed. The entry exists only now, with its file in
+/// place. A pasted link gets its id here, from yt-dlp's own metadata, and is
+/// deduplicated by it: the new file is dropped if that id is already saved.
+fn on_library(url: String, r: std::result::Result<Printed, String>) {
+    with(|a| {
+        a.saving.retain(|u| *u != url);
+        let p = match r {
+            Ok(p) => p,
+            Err(e) => return a.show_toast(format!("Couldn't save: {e}"), true),
+        };
+        if a.lib.iter().any(|e| e.id == p.id) {
+            let _ = std::fs::remove_file(&p.filepath);
+            return a.show_toast("Already saved", false);
+        }
+        let entry = match library::finalize(&a.lib_root, &p, library::now_iso()) {
+            Ok(entry) => entry,
+            Err(e) => {
+                log(format!("save {} failed: {e}", p.id));
+                let _ = std::fs::remove_file(&p.filepath);
+                return a.show_toast(format!("Couldn't save: {e}"), true);
+            }
+        };
+        a.lib.push(entry);
+        if let Err(e) = library::save(&a.lib_root, &a.lib) {
+            // No entry without a durable index: roll back, drop the file.
+            log(format!("could not write the index: {e}"));
+            if let Some(entry) = a.lib.pop() {
+                let _ = std::fs::remove_file(library::audio_dir(&a.lib_root).join(entry.file));
+            }
+            return a.show_toast(format!("Couldn't save: {e}"), true);
+        }
+        log(format!(
+            "saved {} ({} bytes)",
+            p.id,
+            a.lib.last().map_or(0, |e| e.bytes)
+        ));
+        for t in a.queue.iter_mut().filter(|t| t.url == url) {
+            t.id.get_or_insert_with(|| p.id.clone());
+        }
+        a.show_toast("Saved", false);
+    });
+    repaint();
+}
+
 fn next() {
     let more = with(|a| {
         if a.playing && a.qi + 1 < a.queue.len() {
@@ -978,6 +1104,13 @@ fn paint(a: &App, hdc: HDC) {
     }
 }
 
+fn toast_now(a: &App) -> Option<(String, COLORREF)> {
+    a.toast
+        .as_ref()
+        .filter(|t| Instant::now() < t.until)
+        .map(|t| (t.text.clone(), if t.error { ERR } else { ACCENT }))
+}
+
 fn status_rect(a: &App) -> RECT {
     let top = a.s(PAD + SEARCH_H + 8 + ROWS * ROW_H + 4);
     RECT {
@@ -991,6 +1124,9 @@ fn status_rect(a: &App) -> RECT {
 fn status(a: &App) -> (String, COLORREF) {
     if let Some(toast) = volume_toast(a) {
         return (toast, ACCENT);
+    }
+    if let Some(toast) = toast_now(a) {
+        return toast;
     }
     if let Some(e) = &a.error {
         return (e.clone(), ERR);
@@ -1058,6 +1194,7 @@ struct PlayerHits {
     prev: RECT,
     play: RECT,
     next: RECT,
+    heart: RECT,
     rows: Vec<RECT>,
 }
 
@@ -1088,6 +1225,12 @@ fn player_hits(a: &App) -> PlayerHits {
             bottom: cy + r,
         },
         next: side(a.s(64)),
+        heart: RECT {
+            left: a.s(W - P - 32),
+            top: a.s(40),
+            right: a.s(W - P),
+            bottom: a.s(68),
+        },
         rows,
     }
 }
@@ -1125,7 +1268,27 @@ fn paint_player(a: &App, hdc: HDC, rc: RECT) {
             header
         };
         text(hdc, &header, line(18, 16), a.fonts.meta, DIM, LINE);
-        text(hdc, &a.now_title, line(40, 28), a.fonts.big, TEXT, LINE);
+        let hits = player_hits(a);
+        let title_rc = RECT {
+            right: hits.heart.left - s(6),
+            ..line(40, 28)
+        };
+        text(hdc, &a.now_title, title_rc, a.fonts.big, TEXT, LINE);
+        let (glyph, color) = if library::is_saved(&a.lib, t) {
+            (G_HEART_FILL, ACCENT)
+        } else if a.saving.contains(&t.url) {
+            (G_HEART_FILL, DIM)
+        } else {
+            (G_HEART, DIM)
+        };
+        text(
+            hdc,
+            glyph,
+            hits.heart,
+            a.fonts.icons,
+            color,
+            DT_SINGLELINE | DT_CENTER | DT_VCENTER,
+        );
         text(hdc, &t.channel, line(70, 18), a.fonts.meta, DIM, LINE);
 
         // Progress.
@@ -1161,7 +1324,6 @@ fn paint_player(a: &App, hdc: HDC, rc: RECT) {
         }
 
         // Controls.
-        let hits = player_hits(a);
         let has_prev = a.qi > 0 || a.pos > 3.0;
         let has_next = a.qi + 1 < a.queue.len();
         text(
@@ -1243,18 +1405,25 @@ fn paint_player(a: &App, hdc: HDC, rc: RECT) {
         let foot = line(FOOT_Y + 1, 34);
         const HINT: &str = "Space pause · ←→ tracks · ↑↓ volume  Shift ±10 · Tab search";
         text(hdc, HINT, foot, a.fonts.meta, DIM, LINE | DT_VCENTER);
-        let right = match volume_toast(a) {
-            Some(_) => {
-                // Leave room for the hint; drop the dB when it would overlap.
-                let room = (rc.right - s(P)) - (s(P) + text_width(hdc, HINT, a.fonts.meta) + s(12));
-                (volume_text_fitted(a.level, room, hdc, a.fonts.meta), ACCENT)
-            }
-            _ => ("type to search".to_string(), DIM),
+        let hint_w = text_width(hdc, HINT, a.fonts.meta);
+        let right = if let Some(toast) = toast_now(a) {
+            toast
+        } else if volume_toast(a).is_some() {
+            // Leave room for the hint; drop the dB when it would overlap.
+            let room = (rc.right - s(P)) - (s(P) + hint_w + s(12));
+            (volume_text_fitted(a.level, room, hdc, a.fonts.meta), ACCENT)
+        } else {
+            ("type to search".to_string(), DIM)
+        };
+        // Right-aligned, but never over the hint: long messages get an ellipsis.
+        let foot_right = RECT {
+            left: foot.left + hint_w + s(12),
+            ..foot
         };
         text(
             hdc,
             &right.0,
-            foot,
+            foot_right,
             a.fonts.meta,
             right.1,
             LINE | DT_VCENTER | DT_RIGHT,
@@ -1277,6 +1446,8 @@ fn on_player_click(x: i32, y: i32) {
     let inside = |r: &RECT| unsafe { PtInRect(r, pt).as_bool() };
     if inside(&hits.play) {
         with(|a| a.player.toggle_pause());
+    } else if inside(&hits.heart) {
+        save_current();
     } else if inside(&hits.prev) {
         prev();
     } else if inside(&hits.next) {
@@ -1533,15 +1704,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 on_player(*Box::from_raw(lp.0 as *mut Event));
                 LRESULT(0)
             }
+            WM_LIBRARY => {
+                let b = Box::from_raw(lp.0 as *mut (String, std::result::Result<Printed, String>));
+                let (url, r) = *b;
+                on_library(url, r);
+                LRESULT(0)
+            }
             WM_TIMER if wp.0 == TIMER_POS => {
                 let poll = with(|a| {
                     if a.view == View::Player && a.playing && !a.paused {
                         a.player.query_pos();
                     }
-                    a.volume_flash.is_some_and(|t| Instant::now() >= t)
+                    let now = Instant::now();
+                    let toast_done = a.toast.as_ref().is_some_and(|t| now >= t.until);
+                    if toast_done {
+                        a.toast = None;
+                    }
+                    let flash_done = a.volume_flash.is_some_and(|t| now >= t);
+                    if flash_done {
+                        a.volume_flash = None;
+                    }
+                    toast_done || flash_done
                 });
                 if poll == Some(true) {
-                    with(|a| a.volume_flash = None);
                     repaint();
                 }
                 LRESULT(0)

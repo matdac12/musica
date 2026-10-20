@@ -11,7 +11,9 @@ a windowless `mpv` child that resolves YouTube through `yt-dlp`; it uses about
 ## Status
 
 Prototype. Search, play, a player view with the queue, pause, next/previous,
-volume. Live streams (lofi radios) work. No saved library or search history yet.
+volume. Live streams (lofi radios) work. Save the playing track to a local
+library (below). Browsing the library, playing from disk and search history
+come later.
 
 ## Usage
 
@@ -32,6 +34,7 @@ plays.
 | Space | Pause / resume |
 | → / ← | Next / previous (← restarts the track if you're past 3 s) |
 | ↑ / ↓ | Volume (max 100%) |
+| Ctrl+S, click the heart | Save the track (see Saved tracks) |
 | Any letter | Start a new search |
 | Tab | Search view |
 | Esc, click away | Hide |
@@ -43,6 +46,22 @@ plays.
 | Enter, double-click | Play the selected result and open the player |
 | Space | Pause / resume (in the results) |
 | Esc, Tab | Back to the player (Esc hides when nothing plays) |
+
+## Saved tracks
+
+On the player, click the heart next to the title or press **Ctrl+S** to save
+the playing track: Musica downloads it with `yt-dlp` as the native best audio
+(`.webm` or `.m4a`, no re-encode, no ffmpeg) into `%LOCALAPPDATA%\Musica\library\`
+and lists it in `library.json` next to it. The heart is an outline when not
+saved, dim while queued or downloading, orange once saved.
+
+- Only finite tracks can be saved. A live stream, or a pasted link before its
+  length is known, says "Live streams can't be saved". A saved track says
+  "Already saved". Save never toggles, and there is no unsave yet.
+- Downloads run one at a time and stop when Musica quits. A failed download
+  leaves nothing behind and shows "Couldn't save: ...".
+- The library survives reinstalls. A damaged `library.json` is kept as
+  `library.json.bad` and Musica starts with an empty library; the audio files stay.
 
 The tray icon: left-click toggles the popup; right-click has Pause, Next, Stop and Quit.
 The log is `%LOCALAPPDATA%\Musica\musica.log`.

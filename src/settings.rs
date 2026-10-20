@@ -57,7 +57,7 @@ fn file_name() -> String {
 /// Debug builds only, like the window class: the test resident writes its own
 /// file. Release builds always use `settings.json`.
 #[cfg(debug_assertions)]
-fn instance_suffix() -> Option<String> {
+pub fn instance_suffix() -> Option<String> {
     std::env::var("MUSICA_INSTANCE")
         .ok()
         .as_deref()
@@ -65,7 +65,7 @@ fn instance_suffix() -> Option<String> {
 }
 
 #[cfg(not(debug_assertions))]
-fn instance_suffix() -> Option<String> {
+pub fn instance_suffix() -> Option<String> {
     None
 }
 

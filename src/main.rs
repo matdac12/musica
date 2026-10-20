@@ -1,7 +1,9 @@
 #![windows_subsystem = "windows"]
 
+mod download;
 mod job;
 mod launch;
+mod library;
 mod log;
 mod player;
 mod search;
